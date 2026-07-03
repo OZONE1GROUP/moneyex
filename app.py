@@ -117,6 +117,12 @@ class Transaction(Base):
     status = Column(Enum(TxnStatus), default=TxnStatus.completed, index=True)
     risk_score = Column(Integer, default=0)
     is_flagged = Column(Boolean, default=False, index=True)
+    kyc_status = Column(String(16), default="verified", index=True)
+    is_pep = Column(Boolean, default=False, index=True)
+    is_sanctioned = Column(Boolean, default=False, index=True)
+    nps = Column(Integer, nullable=True)
+    satisfaction = Column(Integer, nullable=True)
+    handling_time = Column(Integer, nullable=True)
 
 
 class UserCreate(BaseModel):
@@ -190,6 +196,209 @@ def _grp(items, keyfn, topn=None):
     return out[:topn] if topn else out
 
 
+
+def _monthly(txns, valfn):
+    m = {}
+    for t in txns:
+        k = t.created_at.strftime("%Y-%m")
+        m[k] = m.get(k, 0) + valfn(t)
+    return [(k, m[k]) for k in sorted(m)]
+
+def _forecast(values, periods=3):
+    n = len(values)
+    if n < 2:
+        last = values[-1] if values else 0
+        return [round(max(0, last), 2)] * periods
+    xs = list(range(n)); ys = values
+    mx = sum(xs) / n; my = sum(ys) / n
+    denom = sum((x - mx) ** 2 for x in xs) or 1
+    b = sum((xs[i] - mx) * (ys[i] - my) for i in range(n)) / denom
+    a = my - b * mx
+    return [round(max(0, a + b * (n + i)), 2) for i in range(periods)]
+
+def _next_months(last, n):
+    try: y, m = map(int, last.split("-"))
+    except Exception: y, m = 2026, 1
+    out = []
+    for _ in range(n):
+        m += 1
+        if m > 12: m = 1; y += 1
+        out.append(f"{y:04d}-{m:02d}")
+    return out
+
+def _build_cash(txns):
+    branch_cash = {}; cur_pos = {}; cash_in = cash_out = 0.0
+    for t in txns:
+        amt = t.amount
+        bin_ = amt if t.direction != Direction.sell else 0.0
+        bout = amt if t.direction == Direction.sell else 0.0
+        cash_in += bin_; cash_out += bout
+        b = t.branch or "Unknown"
+        d = branch_cash.setdefault(b, {"name": b, "cash_in": 0.0, "cash_out": 0.0})
+        d["cash_in"] += bin_; d["cash_out"] += bout
+        if t.foreign_currency:
+            c = cur_pos.setdefault(t.foreign_currency, {"name": t.foreign_currency, "bought": 0.0, "sold": 0.0})
+            if t.direction == Direction.buy: c["bought"] += amt
+            elif t.direction == Direction.sell: c["sold"] += amt
+    bl = []
+    for d in branch_cash.values():
+        d["net"] = round(d["cash_in"] - d["cash_out"], 2); d["cash_in"] = round(d["cash_in"], 2); d["cash_out"] = round(d["cash_out"], 2); bl.append(d)
+    bl.sort(key=lambda x: -x["net"])
+    cl = []
+    for c in cur_pos.values():
+        c["net_position"] = round(c["bought"] - c["sold"], 2); c["bought"] = round(c["bought"], 2); c["sold"] = round(c["sold"], 2); cl.append(c)
+    cl.sort(key=lambda x: -abs(x["net_position"]))
+    series = _monthly(txns, lambda t: (t.amount if t.direction != Direction.sell else -t.amount))
+    months = [k for k, _ in series]
+    fc = _forecast([v for _, v in series], 3)
+    nm = _next_months(months[-1] if months else "2026-01", 3)
+    return {"total_cash_in": round(cash_in, 2), "total_cash_out": round(cash_out, 2),
+            "net_position": round(cash_in - cash_out, 2), "branch_cash": bl, "currency_positions": cl,
+            "forecast": [{"month": nm[i], "net": fc[i]} for i in range(3)]}
+
+def _build_operations(txns):
+    wd = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    hourmap = {h: 0 for h in range(24)}; wdmap = {w: 0 for w in wd}
+    for t in txns: hourmap[t.created_at.hour] += 1; wdmap[wd[t.created_at.weekday()]] += 1
+    peak_hour = max(hourmap, key=hourmap.get); peak_day = max(wdmap, key=wdmap.get)
+    emp = {}
+    for t in txns:
+        e = t.employee or "Unassigned"; d = emp.setdefault(e, {"name": e, "count": 0, "handle": [], "value": 0.0})
+        d["count"] += 1; d["value"] += t.amount
+        if t.handling_time: d["handle"].append(t.handling_time)
+    emps = []
+    for d in emp.values():
+        d["avg_handle_sec"] = round(sum(d["handle"]) / len(d["handle"])) if d["handle"] else None
+        d["value"] = round(d["value"], 2); d.pop("handle"); emps.append(d)
+    emps.sort(key=lambda x: -x["count"])
+    br = {}
+    for t in txns:
+        b = t.branch or "Unknown"; d = br.setdefault(b, {"name": b, "count": 0, "customers": set(), "emps": set()})
+        d["count"] += 1; d["customers"].add(t.customer_id)
+        if t.employee: d["emps"].add(t.employee)
+    brs = []
+    for d in br.values():
+        d["footfall"] = len(d["customers"]); d["staff"] = len(d["emps"])
+        d["txn_per_staff"] = round(d["count"] / d["staff"], 1) if d["staff"] else d["count"]
+        d.pop("customers"); d.pop("emps"); brs.append(d)
+    brs.sort(key=lambda x: -x["count"])
+    ch = {}
+    for t in txns:
+        c = t.channel.value; d = ch.setdefault(c, {"name": c, "total": 0, "completed": 0, "failed": 0})
+        d["total"] += 1
+        if t.status == TxnStatus.completed: d["completed"] += 1
+        elif t.status == TxnStatus.failed: d["failed"] += 1
+    chs = [{"name": d["name"], "total": d["total"], "success_rate": round(d["completed"] / d["total"] * 100, 1) if d["total"] else 0, "failed": d["failed"]} for d in ch.values()]
+    chs.sort(key=lambda x: -x["total"])
+    aht = [t.handling_time for t in txns if t.handling_time]
+    return {"peak_hour": f"{peak_hour:02d}:00", "peak_day": peak_day,
+            "avg_handling_sec": round(sum(aht) / len(aht)) if aht else None,
+            "by_hour": [{"hour": f"{h:02d}:00", "count": hourmap[h]} for h in range(24)],
+            "by_weekday": [{"day": w, "count": wdmap[w]} for w in wd],
+            "employees": emps[:15], "branches": brs, "channel_success": chs}
+
+def _build_compliance(txns):
+    THRESH = 3000.0
+    cash_txns = [t for t in txns if (t.payment_method or "").lower() == "cash"]
+    ctr = [t for t in cash_txns if t.amount >= THRESH]
+    flagged = [t for t in txns if t.is_flagged]
+    daymap = {}
+    for t in txns: daymap.setdefault((t.customer_id, t.created_at.strftime("%Y-%m-%d")), []).append(t)
+    structuring = []; velocity = 0
+    for (cust, day), lst in daymap.items():
+        if len(lst) >= 3: velocity += 1
+        subs = [x for x in lst if x.amount < THRESH]
+        if len(subs) >= 2 and sum(x.amount for x in subs) >= THRESH:
+            structuring.append({"customer": cust, "date": day, "count": len(subs), "total": round(sum(x.amount for x in subs), 2)})
+    structuring.sort(key=lambda x: -x["total"])
+    kyc = {}
+    for t in txns:
+        k = t.kyc_status or "verified"; kyc[k] = kyc.get(k, 0) + 1
+    pep = len(set(t.customer_id for t in txns if t.is_pep))
+    sanc = len(set(t.customer_id for t in txns if t.is_sanctioned))
+    def rgrp(keyfn):
+        m = {}
+        for t in txns:
+            k = keyfn(t) or "Unknown"; d = m.setdefault(str(k), {"name": str(k), "count": 0, "flagged": 0, "score": 0})
+            d["count"] += 1; d["score"] += (t.risk_score or 0)
+            if t.is_flagged: d["flagged"] += 1
+        out = [{"name": d["name"], "count": d["count"], "flagged": d["flagged"], "avg_risk": round(d["score"] / d["count"], 1) if d["count"] else 0} for d in m.values()]
+        out.sort(key=lambda x: -x["avg_risk"]); return out
+    return {"ctr_count": len(ctr), "ctr_value": round(sum(t.amount for t in ctr), 2), "threshold": THRESH,
+            "str_candidates": len(flagged), "structuring_count": len(structuring), "structuring": structuring[:15],
+            "velocity_alerts": velocity, "pep_customers": pep, "sanction_hits": sanc,
+            "kyc_status": [{"name": k, "count": v} for k, v in kyc.items()],
+            "pending_kyc": kyc.get("pending", 0), "expired_kyc": kyc.get("expired", 0),
+            "risk_by_country": rgrp(lambda t: t.country)[:10], "risk_by_nationality": rgrp(lambda t: t.nationality)[:10]}
+
+def _build_predictive(txns):
+    rev_series = _monthly(txns, _rev); vol_series = _monthly(txns, lambda t: 1)
+    rev_fc = _forecast([v for _, v in rev_series], 3); vol_fc = _forecast([v for _, v in vol_series], 3)
+    months = [k for k, _ in rev_series]; nm = _next_months(months[-1] if months else "2026-01", 3)
+    cur_month = {}
+    for t in txns:
+        if not t.foreign_currency: continue
+        cur_month.setdefault(t.foreign_currency, {}).setdefault(t.created_at.strftime("%Y-%m"), 0)
+        cur_month[t.foreign_currency][t.created_at.strftime("%Y-%m")] += t.amount
+    cur_fc = []
+    for cur, mm in cur_month.items():
+        series = [mm[k] for k in sorted(mm)]
+        cur_fc.append({"name": cur, "forecast_next": _forecast(series, 1)[0]})
+    cur_fc.sort(key=lambda x: -x["forecast_next"]); cur_fc = cur_fc[:8]
+    dormant = at_risk = 0
+    if txns:
+        maxd = max(t.created_at for t in txns); last_by = {}
+        for t in txns: last_by[t.customer_id] = max(last_by.get(t.customer_id, t.created_at), t.created_at)
+        dormant = sum(1 for d in last_by.values() if (maxd - d).days > 60)
+        at_risk = sum(1 for d in last_by.values() if 30 < (maxd - d).days <= 60)
+    return {"revenue_forecast": [{"month": nm[i], "value": rev_fc[i]} for i in range(3)],
+            "volume_forecast": [{"month": nm[i], "count": round(vol_fc[i])} for i in range(3)],
+            "revenue_history": [{"month": k, "value": round(v, 2)} for k, v in rev_series],
+            "volume_history": [{"month": k, "count": v} for k, v in vol_series],
+            "currency_demand": cur_fc, "dormant_customers": dormant, "at_risk_customers": at_risk}
+
+def _build_geo(txns):
+    city = _grp(txns, lambda t: t.city, 15)
+    corr = {}
+    for t in txns:
+        if t.destination_country:
+            k = t.destination_country; d = corr.setdefault(k, {"name": k, "count": 0, "value": 0.0})
+            d["count"] += 1; d["value"] += t.amount
+    corridors = sorted(corr.values(), key=lambda x: -x["value"])
+    for d in corridors: d["value"] = round(d["value"], 2)
+    hot = {}
+    for t in txns:
+        if t.is_flagged:
+            k = t.city or t.branch or "Unknown"; d = hot.setdefault(k, {"name": k, "flagged": 0, "value": 0.0})
+            d["flagged"] += 1; d["value"] += t.amount
+    hotspots = sorted(hot.values(), key=lambda x: -x["flagged"])
+    for d in hotspots: d["value"] = round(d["value"], 2)
+    return {"cities": [{"name": g["key"], "count": g["count"], "value": g["value"]} for g in city],
+            "corridors": corridors[:15], "fraud_hotspots": hotspots[:10]}
+
+def _build_insights(txns):
+    if not txns: return {"insights": []}
+    ins = []
+    br = _grp(txns, lambda t: t.branch)
+    if br: ins.append({"type": "Performance", "text": f"{br[0]['key']} is the top branch by volume (OMR {br[0]['value']:,.0f} across {br[0]['count']} transactions)."})
+    if len(br) > 1: ins.append({"type": "Performance", "text": f"{br[-1]['key']} is the lowest-performing branch this period — consider a targeted review."})
+    pred = _build_predictive(txns)
+    if pred["revenue_forecast"]:
+        f = pred["revenue_forecast"][0]; ins.append({"type": "Predictive", "text": f"Projected revenue for {f['month']}: OMR {f['value']:,.0f} (trend-based forecast)."})
+    if pred["dormant_customers"]: ins.append({"type": "Retention", "text": f"{pred['dormant_customers']} customers are dormant (no activity in 60+ days) — retention outreach recommended."})
+    if pred["currency_demand"]:
+        c = pred["currency_demand"][0]; ins.append({"type": "Prescriptive", "text": f"{c['name']} shows the highest projected demand — consider increasing {c['name']} inventory across branches."})
+    comp = _build_compliance(txns)
+    if comp["ctr_count"]: ins.append({"type": "Compliance", "text": f"{comp['ctr_count']} cash transactions breach the CTR threshold (OMR {comp['threshold']:,.0f}) — ensure Currency Transaction Reports are filed."})
+    if comp["structuring_count"]: ins.append({"type": "Risk", "text": f"{comp['structuring_count']} possible structuring pattern(s) detected — review for smurfing / STR filing."})
+    if comp["expired_kyc"]: ins.append({"type": "Compliance", "text": f"{comp['expired_kyc']} transactions involve customers with expired KYC — refresh due diligence."})
+    if comp["sanction_hits"]: ins.append({"type": "Risk", "text": f"{comp['sanction_hits']} customer(s) match sanction/watchlist flags — escalate immediately."})
+    cash = _build_cash(txns)
+    neg = [b for b in cash["branch_cash"] if b["net"] < 0]
+    if neg: ins.append({"type": "Cash", "text": f"{len(neg)} branch(es) show negative net OMR cash flow — plan replenishment: " + ", ".join(b["name"] for b in neg[:3]) + "."})
+    return {"insights": ins}
+
+
 analytics_router = APIRouter(prefix="/analytics", tags=["analytics"])
 
 @analytics_router.get("/dashboard")
@@ -237,7 +446,8 @@ async def advanced(from_date: Optional[str] = Query(None), to_date: Optional[str
     if to_date: q = q.where(Transaction.created_at <= datetime.fromisoformat(to_date))
     txns = (await db.execute(q)).scalars().all()
     empty = {"executive": {}, "transactions": {}, "customers": {}, "fx": {}, "profitability": {},
-             "branches": [], "employees": [], "remittance": {}, "risk": {}}
+             "branches": [], "employees": [], "remittance": {}, "risk": {},
+             "cash": {}, "operations": {}, "compliance": {}, "predictive": {}, "geo": {}, "insights": {}}
     if not txns: return empty
 
     tc = len(txns); tv = sum(t.amount for t in txns)
@@ -396,7 +606,10 @@ async def advanced(from_date: Optional[str] = Query(None), to_date: Optional[str
 
     return {"executive": executive, "transactions": transactions, "customers": customers, "fx": fx,
             "profitability": profitability, "branches": branches, "employees": employees,
-            "remittance": remittance, "risk": risk}
+            "remittance": remittance, "risk": risk,
+            "cash": _build_cash(txns), "operations": _build_operations(txns),
+            "compliance": _build_compliance(txns), "predictive": _build_predictive(txns),
+            "geo": _build_geo(txns), "insights": _build_insights(txns)}
 
 print("part1 ok")
 
@@ -442,7 +655,9 @@ def _txn_dict(t: Transaction):
             "commission": t.commission, "fx_margin": t.fx_margin, "service_fee": t.service_fee,
             "vat": t.vat, "cost": t.cost, "branch": t.branch, "city": t.city, "country": t.country,
             "destination_country": t.destination_country, "corridor": t.corridor, "employee": t.employee,
-            "status": t.status.value if t.status else None, "risk_score": t.risk_score, "is_flagged": t.is_flagged}
+            "status": t.status.value if t.status else None, "risk_score": t.risk_score, "is_flagged": t.is_flagged,
+            "kyc_status": t.kyc_status, "is_pep": t.is_pep, "is_sanctioned": t.is_sanctioned,
+            "nps": t.nps, "satisfaction": t.satisfaction, "handling_time": t.handling_time}
 
 @txn_router.get("/")
 async def list_transactions(page: int = Query(1, ge=1), limit: int = Query(20, le=200),
@@ -479,7 +694,7 @@ async def export_transactions(channel: Optional[str] = None, txn_type: Optional[
             "channel", "txn_type", "direction", "payment_method", "amount", "currency", "foreign_currency",
             "currency_pair", "fx_rate", "commission", "fx_margin", "service_fee", "vat", "cost",
             "branch", "city", "country", "destination_country", "corridor", "employee", "status",
-            "risk_score", "is_flagged"]
+            "risk_score", "is_flagged", "kyc_status", "is_pep", "is_sanctioned", "nps", "satisfaction", "handling_time"]
     def gen():
         buf = io.StringIO(); w = csv.writer(buf); w.writerow(cols); yield buf.getvalue(); buf.seek(0); buf.truncate(0)
         for t in rows:
@@ -589,7 +804,13 @@ def _row_to_txn(row, seen):
         country=sv(_pick(row, "country") or "Oman"),
         destination_country=sv(_pick(row, "destination_country", "beneficiary_country", "destination")),
         corridor=sv(_pick(row, "corridor", "route")), employee=sv(_pick(row, "employee", "cashier", "staff", "teller")),
-        status=TxnStatus(st), risk_score=score, is_flagged=flagged)
+        status=TxnStatus(st), risk_score=score, is_flagged=flagged,
+        kyc_status=(str(_pick(row, "kyc_status", "kyc") or "verified").strip().lower() if _pick(row, "kyc_status", "kyc") else "verified"),
+        is_pep=str(_pick(row, "is_pep", "pep") or "").strip().lower() in ("1", "true", "yes", "y"),
+        is_sanctioned=str(_pick(row, "is_sanctioned", "sanctioned", "sanction") or "").strip().lower() in ("1", "true", "yes", "y"),
+        nps=int(_num(_pick(row, "nps"))) if _pick(row, "nps") else None,
+        satisfaction=int(_num(_pick(row, "satisfaction", "csat"))) if _pick(row, "satisfaction", "csat") else None,
+        handling_time=int(_num(_pick(row, "handling_time", "service_time"))) if _pick(row, "handling_time", "service_time") else None)
 
 @txn_router.post("/import", dependencies=[Depends(require_analyst)])
 async def import_transactions(file: UploadFile = File(...), mode: str = Form("replace"), db: AsyncSession = Depends(get_db)):
@@ -703,7 +924,11 @@ async def seed_demo_data():
                 fx_rate=round(random.uniform(0.4, 500), 3), commission=comm, fx_margin=fxm, service_fee=svc, vat=vat, cost=cost,
                 branch=br, city=city, country="Oman", destination_country=dest,
                 corridor=f"OMR/{cur}", employee=random.choice(emps), status=st,
-                risk_score=score, is_flagged=score >= 65))
+                risk_score=score, is_flagged=score >= 65,
+                kyc_status=random.choices(["verified", "pending", "expired"], weights=[88, 8, 4])[0],
+                is_pep=random.random() < 0.02, is_sanctioned=random.random() < 0.008,
+                nps=random.randint(0, 10), satisfaction=random.randint(1, 5),
+                handling_time=random.randint(60, 900)))
         db.add_all(rows); await db.commit()
 
 @app.get("/health")
