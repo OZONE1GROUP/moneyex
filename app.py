@@ -876,16 +876,448 @@ async def admin_stats(db: AsyncSession = Depends(get_db), _: User = Depends(requ
     return {"total_users": tu, "active_users": au, "total_transactions": tt, "total_value": round(tv, 2)}
 
 
-app = FastAPI(title=settings.PROJECT_NAME, version="2.0.0")
+# ============================ CRM + HELPDESK ============================
+class ContactStatus(str, enum.Enum):
+    lead = "lead"; prospect = "prospect"; customer = "customer"; vip = "vip"; churned = "churned"
+class ContactType(str, enum.Enum):
+    individual = "individual"; corporate = "corporate"
+class DealStage(str, enum.Enum):
+    new = "new"; contacted = "contacted"; qualified = "qualified"; proposal = "proposal"; won = "won"; lost = "lost"
+class TicketPriority(str, enum.Enum):
+    low = "low"; medium = "medium"; high = "high"; urgent = "urgent"
+class TicketStatus(str, enum.Enum):
+    open = "open"; pending = "pending"; on_hold = "on_hold"; resolved = "resolved"; closed = "closed"
+
+class Contact(Base):
+    __tablename__ = "contacts"
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(120), index=True)
+    email = Column(String(200), index=True)
+    phone = Column(String(40), nullable=True)
+    company = Column(String(120), nullable=True)
+    contact_type = Column(Enum(ContactType), default=ContactType.individual, index=True)
+    status = Column(Enum(ContactStatus), default=ContactStatus.lead, index=True)
+    source = Column(String(40), nullable=True, index=True)
+    owner = Column(String(80), nullable=True, index=True)
+    nationality = Column(String(64), nullable=True)
+    tags = Column(String(200), nullable=True)
+    lifetime_value = Column(Float, default=0.0)
+    last_contact = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=sqlfunc.now(), index=True)
+
+class Deal(Base):
+    __tablename__ = "deals"
+    id = Column(Integer, primary_key=True, index=True)
+    title = Column(String(160))
+    contact_name = Column(String(120), index=True)
+    stage = Column(Enum(DealStage), default=DealStage.new, index=True)
+    value = Column(Float, default=0.0)
+    probability = Column(Integer, default=10)
+    owner = Column(String(80), nullable=True, index=True)
+    source = Column(String(40), nullable=True)
+    expected_close = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=sqlfunc.now(), index=True)
+    closed_at = Column(DateTime(timezone=True), nullable=True)
+
+class Ticket(Base):
+    __tablename__ = "tickets"
+    id = Column(Integer, primary_key=True, index=True)
+    ref = Column(String(20), unique=True, index=True)
+    subject = Column(String(200))
+    description = Column(String(2000), nullable=True)
+    requester = Column(String(120), index=True)
+    requester_email = Column(String(200), nullable=True)
+    assignee = Column(String(80), nullable=True, index=True)
+    priority = Column(Enum(TicketPriority), default=TicketPriority.medium, index=True)
+    status = Column(Enum(TicketStatus), default=TicketStatus.open, index=True)
+    category = Column(String(40), index=True)
+    channel = Column(String(30), nullable=True, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=sqlfunc.now(), index=True)
+    first_response_at = Column(DateTime(timezone=True), nullable=True)
+    resolved_at = Column(DateTime(timezone=True), nullable=True)
+    sla_due = Column(DateTime(timezone=True), nullable=True)
+    first_response_mins = Column(Integer, nullable=True)
+    resolution_mins = Column(Integer, nullable=True)
+    sla_breached = Column(Boolean, default=False, index=True)
+    csat = Column(Integer, nullable=True)
+
+
+class ContactIn(BaseModel):
+    name: str; email: Optional[str] = None; phone: Optional[str] = None; company: Optional[str] = None
+    contact_type: ContactType = ContactType.individual; status: ContactStatus = ContactStatus.lead
+    source: Optional[str] = None; owner: Optional[str] = None; nationality: Optional[str] = None
+    tags: Optional[str] = None; lifetime_value: float = 0.0
+class ContactPatch(BaseModel):
+    name: Optional[str] = None; email: Optional[str] = None; phone: Optional[str] = None; company: Optional[str] = None
+    contact_type: Optional[ContactType] = None; status: Optional[ContactStatus] = None
+    source: Optional[str] = None; owner: Optional[str] = None; nationality: Optional[str] = None
+    tags: Optional[str] = None; lifetime_value: Optional[float] = None
+class DealIn(BaseModel):
+    title: str; contact_name: Optional[str] = None; stage: DealStage = DealStage.new
+    value: float = 0.0; probability: int = 10; owner: Optional[str] = None; source: Optional[str] = None
+    expected_close: Optional[str] = None
+class DealPatch(BaseModel):
+    title: Optional[str] = None; contact_name: Optional[str] = None; stage: Optional[DealStage] = None
+    value: Optional[float] = None; probability: Optional[int] = None; owner: Optional[str] = None
+    source: Optional[str] = None; expected_close: Optional[str] = None
+class TicketIn(BaseModel):
+    subject: str; description: Optional[str] = None; requester: Optional[str] = None; requester_email: Optional[str] = None
+    assignee: Optional[str] = None; priority: TicketPriority = TicketPriority.medium
+    status: TicketStatus = TicketStatus.open; category: Optional[str] = "general"; channel: Optional[str] = "web"; csat: Optional[int] = None
+class TicketPatch(BaseModel):
+    subject: Optional[str] = None; description: Optional[str] = None; requester: Optional[str] = None
+    assignee: Optional[str] = None; priority: Optional[TicketPriority] = None; status: Optional[TicketStatus] = None
+    category: Optional[str] = None; channel: Optional[str] = None; csat: Optional[int] = None
+
+
+def _pdate(v):
+    if not v: return None
+    try: return datetime.fromisoformat(str(v)[:19])
+    except Exception:
+        try: return datetime.strptime(str(v)[:10], "%Y-%m-%d")
+        except Exception: return None
+
+def _contact_dict(c):
+    return {"id": c.id, "name": c.name, "email": c.email, "phone": c.phone, "company": c.company,
+            "contact_type": c.contact_type.value if c.contact_type else None, "status": c.status.value if c.status else None,
+            "source": c.source, "owner": c.owner, "nationality": c.nationality, "tags": c.tags,
+            "lifetime_value": round(c.lifetime_value or 0, 2),
+            "last_contact": c.last_contact.isoformat() if c.last_contact else None,
+            "created_at": c.created_at.isoformat() if c.created_at else None}
+
+def _deal_dict(d):
+    return {"id": d.id, "title": d.title, "contact_name": d.contact_name, "stage": d.stage.value if d.stage else None,
+            "value": round(d.value or 0, 2), "probability": d.probability, "owner": d.owner, "source": d.source,
+            "expected_close": d.expected_close.isoformat() if d.expected_close else None,
+            "created_at": d.created_at.isoformat() if d.created_at else None,
+            "closed_at": d.closed_at.isoformat() if d.closed_at else None}
+
+def _ticket_dict(t):
+    return {"id": t.id, "ref": t.ref, "subject": t.subject, "description": t.description, "requester": t.requester,
+            "requester_email": t.requester_email, "assignee": t.assignee,
+            "priority": t.priority.value if t.priority else None, "status": t.status.value if t.status else None,
+            "category": t.category, "channel": t.channel,
+            "created_at": t.created_at.isoformat() if t.created_at else None,
+            "first_response_at": t.first_response_at.isoformat() if t.first_response_at else None,
+            "resolved_at": t.resolved_at.isoformat() if t.resolved_at else None,
+            "sla_due": t.sla_due.isoformat() if t.sla_due else None,
+            "first_response_mins": t.first_response_mins, "resolution_mins": t.resolution_mins,
+            "sla_breached": t.sla_breached, "csat": t.csat}
+
+_SLA_HOURS = {"urgent": 4, "high": 8, "medium": 24, "low": 48}
+
+
+# ---------------- CRM ----------------
+crm_router = APIRouter(prefix="/crm", tags=["crm"])
+
+@crm_router.get("/contacts")
+async def list_contacts(page: int = Query(1, ge=1), limit: int = Query(20, le=200),
+        status: Optional[str] = None, contact_type: Optional[str] = None, source: Optional[str] = None,
+        owner: Optional[str] = None, search: Optional[str] = None,
+        db: AsyncSession = Depends(get_db), _: User = Depends(get_current_user)):
+    q = select(Contact).order_by(Contact.created_at.desc())
+    if status: q = q.where(Contact.status == status)
+    if contact_type: q = q.where(Contact.contact_type == contact_type)
+    if source: q = q.where(Contact.source == source)
+    if owner: q = q.where(Contact.owner == owner)
+    if search: q = q.where((Contact.name.ilike(f"%{search}%")) | (Contact.email.ilike(f"%{search}%")) | (Contact.company.ilike(f"%{search}%")))
+    total = (await db.execute(select(func.count()).select_from(q.subquery()))).scalar()
+    rows = (await db.execute(q.offset((page - 1) * limit).limit(limit))).scalars().all()
+    return {"total": total, "page": page, "limit": limit, "items": [_contact_dict(c) for c in rows]}
+
+@crm_router.post("/contacts", dependencies=[Depends(require_analyst)])
+async def create_contact(data: ContactIn, db: AsyncSession = Depends(get_db)):
+    c = Contact(**data.model_dump()); db.add(c); await db.commit(); await db.refresh(c)
+    return _contact_dict(c)
+
+@crm_router.patch("/contacts/{cid}", dependencies=[Depends(require_analyst)])
+async def update_contact(cid: int, data: ContactPatch, db: AsyncSession = Depends(get_db)):
+    c = (await db.execute(select(Contact).where(Contact.id == cid))).scalar_one_or_none()
+    if not c: raise HTTPException(status_code=404, detail="Contact not found")
+    for k, v in data.model_dump(exclude_none=True).items(): setattr(c, k, v)
+    await db.commit(); await db.refresh(c)
+    return _contact_dict(c)
+
+@crm_router.delete("/contacts/{cid}", dependencies=[Depends(require_analyst)])
+async def delete_contact(cid: int, db: AsyncSession = Depends(get_db)):
+    c = (await db.execute(select(Contact).where(Contact.id == cid))).scalar_one_or_none()
+    if not c: raise HTTPException(status_code=404, detail="Contact not found")
+    await db.delete(c); await db.commit(); return {"ok": True}
+
+@crm_router.get("/deals")
+async def list_deals(page: int = Query(1, ge=1), limit: int = Query(50, le=200),
+        stage: Optional[str] = None, owner: Optional[str] = None, source: Optional[str] = None, search: Optional[str] = None,
+        db: AsyncSession = Depends(get_db), _: User = Depends(get_current_user)):
+    q = select(Deal).order_by(Deal.created_at.desc())
+    if stage: q = q.where(Deal.stage == stage)
+    if owner: q = q.where(Deal.owner == owner)
+    if source: q = q.where(Deal.source == source)
+    if search: q = q.where((Deal.title.ilike(f"%{search}%")) | (Deal.contact_name.ilike(f"%{search}%")))
+    total = (await db.execute(select(func.count()).select_from(q.subquery()))).scalar()
+    rows = (await db.execute(q.offset((page - 1) * limit).limit(limit))).scalars().all()
+    return {"total": total, "page": page, "limit": limit, "items": [_deal_dict(d) for d in rows]}
+
+@crm_router.post("/deals", dependencies=[Depends(require_analyst)])
+async def create_deal(data: DealIn, db: AsyncSession = Depends(get_db)):
+    payload = data.model_dump(); ec = _pdate(payload.pop("expected_close", None))
+    d = Deal(**payload, expected_close=ec)
+    if d.stage in (DealStage.won, DealStage.lost): d.closed_at = datetime.utcnow()
+    db.add(d); await db.commit(); await db.refresh(d)
+    return _deal_dict(d)
+
+@crm_router.patch("/deals/{did}", dependencies=[Depends(require_analyst)])
+async def update_deal(did: int, data: DealPatch, db: AsyncSession = Depends(get_db)):
+    d = (await db.execute(select(Deal).where(Deal.id == did))).scalar_one_or_none()
+    if not d: raise HTTPException(status_code=404, detail="Deal not found")
+    payload = data.model_dump(exclude_none=True)
+    if "expected_close" in payload: d.expected_close = _pdate(payload.pop("expected_close"))
+    for k, v in payload.items(): setattr(d, k, v)
+    if d.stage in (DealStage.won, DealStage.lost) and not d.closed_at: d.closed_at = datetime.utcnow()
+    await db.commit(); await db.refresh(d)
+    return _deal_dict(d)
+
+@crm_router.delete("/deals/{did}", dependencies=[Depends(require_analyst)])
+async def delete_deal(did: int, db: AsyncSession = Depends(get_db)):
+    d = (await db.execute(select(Deal).where(Deal.id == did))).scalar_one_or_none()
+    if not d: raise HTTPException(status_code=404, detail="Deal not found")
+    await db.delete(d); await db.commit(); return {"ok": True}
+
+@crm_router.get("/analytics")
+async def crm_analytics(db: AsyncSession = Depends(get_db), _: User = Depends(get_current_user)):
+    contacts = (await db.execute(select(Contact))).scalars().all()
+    deals = (await db.execute(select(Deal))).scalars().all()
+    def cg(keyfn):
+        m = {}
+        for c in contacts:
+            k = keyfn(c) or "Unknown"; d = m.setdefault(str(k), {"name": str(k), "count": 0, "value": 0.0})
+            d["count"] += 1; d["value"] += (c.lifetime_value or 0)
+        out = sorted(m.values(), key=lambda x: -x["count"])
+        for d in out: d["value"] = round(d["value"], 2)
+        return out
+    open_stages = [DealStage.new, DealStage.contacted, DealStage.qualified, DealStage.proposal]
+    stage_map = {}
+    for s in DealStage:
+        ds = [d for d in deals if d.stage == s]
+        stage_map[s.value] = {"stage": s.value, "count": len(ds), "value": round(sum(d.value or 0 for d in ds), 2)}
+    won = [d for d in deals if d.stage == DealStage.won]; lost = [d for d in deals if d.stage == DealStage.lost]
+    open_deals = [d for d in deals if d.stage in open_stages]
+    weighted = round(sum((d.value or 0) * (d.probability or 0) / 100 for d in open_deals), 2)
+    total_customers = len([c for c in contacts if c.status in (ContactStatus.customer, ContactStatus.vip)])
+    top_deals = sorted(deals, key=lambda d: -(d.value or 0))[:10]
+    top_contacts = sorted(contacts, key=lambda c: -(c.lifetime_value or 0))[:10]
+    dmonth = {}
+    for d in deals:
+        k = d.created_at.strftime("%Y-%m") if d.created_at else "?"; dmonth[k] = dmonth.get(k, 0) + 1
+    return {
+        "total_contacts": len(contacts),
+        "customers": total_customers,
+        "by_status": cg(lambda c: c.status.value if c.status else None),
+        "by_source": cg(lambda c: c.source),
+        "by_type": cg(lambda c: c.contact_type.value if c.contact_type else None),
+        "by_owner": cg(lambda c: c.owner),
+        "top_contacts": [{"name": c.name, "company": c.company, "status": c.status.value if c.status else None, "value": round(c.lifetime_value or 0, 2)} for c in top_contacts],
+        "pipeline_by_stage": [stage_map[s.value] for s in DealStage],
+        "total_pipeline_value": round(sum(d.value or 0 for d in open_deals), 2),
+        "weighted_pipeline": weighted,
+        "open_deals": len(open_deals), "won_count": len(won), "lost_count": len(lost),
+        "win_rate": round(len(won) / (len(won) + len(lost)) * 100, 1) if (won or lost) else 0,
+        "conversion_rate": round(total_customers / len(contacts) * 100, 1) if contacts else 0,
+        "revenue_won": round(sum(d.value or 0 for d in won), 2),
+        "avg_deal_size": round(sum(d.value or 0 for d in deals) / len(deals), 2) if deals else 0,
+        "deals_trend": [{"month": k, "count": dmonth[k]} for k in sorted(dmonth)],
+        "top_deals": [{"title": d.title, "contact": d.contact_name, "stage": d.stage.value if d.stage else None, "value": round(d.value or 0, 2), "owner": d.owner} for d in top_deals],
+    }
+
+
+# ---------------- Helpdesk ----------------
+help_router = APIRouter(prefix="/helpdesk", tags=["helpdesk"])
+
+@help_router.get("/tickets")
+async def list_tickets(page: int = Query(1, ge=1), limit: int = Query(20, le=200),
+        status: Optional[str] = None, priority: Optional[str] = None, category: Optional[str] = None,
+        channel: Optional[str] = None, assignee: Optional[str] = None, sla_breached: Optional[bool] = None,
+        search: Optional[str] = None, db: AsyncSession = Depends(get_db), _: User = Depends(get_current_user)):
+    q = select(Ticket).order_by(Ticket.created_at.desc())
+    if status: q = q.where(Ticket.status == status)
+    if priority: q = q.where(Ticket.priority == priority)
+    if category: q = q.where(Ticket.category == category)
+    if channel: q = q.where(Ticket.channel == channel)
+    if assignee: q = q.where(Ticket.assignee == assignee)
+    if sla_breached is not None: q = q.where(Ticket.sla_breached == sla_breached)
+    if search: q = q.where((Ticket.subject.ilike(f"%{search}%")) | (Ticket.ref.ilike(f"%{search}%")) | (Ticket.requester.ilike(f"%{search}%")))
+    total = (await db.execute(select(func.count()).select_from(q.subquery()))).scalar()
+    rows = (await db.execute(q.offset((page - 1) * limit).limit(limit))).scalars().all()
+    return {"total": total, "page": page, "limit": limit, "items": [_ticket_dict(t) for t in rows]}
+
+@help_router.post("/tickets", dependencies=[Depends(require_analyst)])
+async def create_ticket(data: TicketIn, db: AsyncSession = Depends(get_db)):
+    now = datetime.utcnow()
+    t = Ticket(ref=f"TKT{str(uuid.uuid4())[:6].upper()}", **data.model_dump())
+    t.created_at = now
+    t.sla_due = now + timedelta(hours=_SLA_HOURS.get(t.priority.value if t.priority else "medium", 24))
+    db.add(t); await db.commit(); await db.refresh(t)
+    return _ticket_dict(t)
+
+@help_router.patch("/tickets/{tid}", dependencies=[Depends(require_analyst)])
+async def update_ticket(tid: int, data: TicketPatch, db: AsyncSession = Depends(get_db)):
+    t = (await db.execute(select(Ticket).where(Ticket.id == tid))).scalar_one_or_none()
+    if not t: raise HTTPException(status_code=404, detail="Ticket not found")
+    for k, v in data.model_dump(exclude_none=True).items(): setattr(t, k, v)
+    now = datetime.utcnow()
+    if t.first_response_at is None and t.status != TicketStatus.open:
+        t.first_response_at = now
+        if t.created_at: t.first_response_mins = int((now - t.created_at.replace(tzinfo=None)).total_seconds() / 60)
+    if t.status in (TicketStatus.resolved, TicketStatus.closed) and t.resolved_at is None:
+        t.resolved_at = now
+        if t.created_at:
+            t.resolution_mins = int((now - t.created_at.replace(tzinfo=None)).total_seconds() / 60)
+            t.sla_breached = bool(t.sla_due and now > t.sla_due.replace(tzinfo=None))
+    await db.commit(); await db.refresh(t)
+    return _ticket_dict(t)
+
+@help_router.delete("/tickets/{tid}", dependencies=[Depends(require_analyst)])
+async def delete_ticket(tid: int, db: AsyncSession = Depends(get_db)):
+    t = (await db.execute(select(Ticket).where(Ticket.id == tid))).scalar_one_or_none()
+    if not t: raise HTTPException(status_code=404, detail="Ticket not found")
+    await db.delete(t); await db.commit(); return {"ok": True}
+
+@help_router.get("/analytics")
+async def help_analytics(db: AsyncSession = Depends(get_db), _: User = Depends(get_current_user)):
+    tks = (await db.execute(select(Ticket))).scalars().all()
+    def tg(keyfn, valfn=None):
+        m = {}
+        for t in tks:
+            k = keyfn(t) or "Unknown"; d = m.setdefault(str(k), {"name": str(k), "count": 0})
+            d["count"] += 1
+        return sorted(m.values(), key=lambda x: -x["count"])
+    resolved = [t for t in tks if t.status in (TicketStatus.resolved, TicketStatus.closed)]
+    open_like = [t for t in tks if t.status in (TicketStatus.open, TicketStatus.pending, TicketStatus.on_hold)]
+    frs = [t.first_response_mins for t in tks if t.first_response_mins is not None]
+    res = [t.resolution_mins for t in resolved if t.resolution_mins is not None]
+    csats = [t.csat for t in tks if t.csat is not None]
+    breached = [t for t in resolved if t.sla_breached]
+    agent_map = {}
+    for t in tks:
+        a = t.assignee or "Unassigned"; d = agent_map.setdefault(a, {"name": a, "count": 0, "resolved": 0, "res_mins": []})
+        d["count"] += 1
+        if t.status in (TicketStatus.resolved, TicketStatus.closed):
+            d["resolved"] += 1
+            if t.resolution_mins is not None: d["res_mins"].append(t.resolution_mins)
+    agents = []
+    for d in agent_map.values():
+        d["avg_resolution_hrs"] = round(sum(d["res_mins"]) / len(d["res_mins"]) / 60, 1) if d["res_mins"] else None
+        d.pop("res_mins"); agents.append(d)
+    agents.sort(key=lambda x: -x["count"])
+    tmonth = {}
+    for t in tks:
+        k = t.created_at.strftime("%Y-%m") if t.created_at else "?"; tmonth[k] = tmonth.get(k, 0) + 1
+    return {
+        "total": len(tks), "open": len([t for t in tks if t.status == TicketStatus.open]),
+        "pending": len([t for t in tks if t.status == TicketStatus.pending]),
+        "on_hold": len([t for t in tks if t.status == TicketStatus.on_hold]),
+        "resolved": len([t for t in tks if t.status == TicketStatus.resolved]),
+        "closed": len([t for t in tks if t.status == TicketStatus.closed]),
+        "backlog": len(open_like),
+        "avg_first_response_hrs": round(sum(frs) / len(frs) / 60, 1) if frs else None,
+        "avg_resolution_hrs": round(sum(res) / len(res) / 60, 1) if res else None,
+        "sla_compliance": round((1 - len(breached) / len(resolved)) * 100, 1) if resolved else 100,
+        "sla_breached": len(breached),
+        "csat_avg": round(sum(csats) / len(csats), 2) if csats else None,
+        "csat_responses": len(csats),
+        "by_status": tg(lambda t: t.status.value if t.status else None),
+        "by_priority": tg(lambda t: t.priority.value if t.priority else None),
+        "by_category": tg(lambda t: t.category),
+        "by_channel": tg(lambda t: t.channel),
+        "agents": agents,
+        "volume_trend": [{"month": k, "count": tmonth[k]} for k in sorted(tmonth)],
+        "recent_open": [{"ref": t.ref, "subject": t.subject, "requester": t.requester, "priority": t.priority.value if t.priority else None, "status": t.status.value if t.status else None, "assignee": t.assignee} for t in sorted(open_like, key=lambda x: (x.priority != TicketPriority.urgent, x.priority != TicketPriority.high))[:15]],
+    }
+
+
+async def seed_crm_helpdesk():
+    async with AsyncSessionLocal() as db:
+        if (await db.execute(select(Contact).limit(1))).scalar_one_or_none(): return
+        owners = ["E. Rashid", "F. Kumar", "S. Ali", "M. Santos", "A. Nair"]
+        agents = ["Layla H.", "Omar K.", "Priya S.", "Yusuf A.", "Sara M."]
+        sources = ["referral", "online", "campaign", "walk-in", "agent"]
+        nats = ["Indian", "Pakistani", "Filipino", "Egyptian", "Bangladeshi", "Omani", "British"]
+        companies = ["Al Noor Trading", "Gulf Logistics", "Dhofar Retail", "Muscat Tech", "Batinah Foods", None, None, None]
+        base = datetime.utcnow() - timedelta(days=180)
+        contacts = []
+        for i in range(160):
+            st = random.choices(list(ContactStatus), weights=[30, 22, 30, 6, 12])[0]
+            ct = random.choices([ContactType.individual, ContactType.corporate], weights=[72, 28])[0]
+            ltv = round(random.uniform(50, 800) if st in (ContactStatus.lead, ContactStatus.prospect) else random.uniform(500, 12000), 2)
+            created = base + timedelta(days=random.randint(0, 180))
+            contacts.append(Contact(name=f"Customer {1000+i}", email=f"cust{1000+i}@example.com",
+                phone=f"+968 9{random.randint(1000000,9999999)}", company=random.choice(companies),
+                contact_type=ct, status=st, source=random.choice(sources), owner=random.choice(owners),
+                nationality=random.choice(nats), tags=random.choice(["remittance", "fx", "corporate", "vip", "payroll"]),
+                lifetime_value=ltv, last_contact=created + timedelta(days=random.randint(0, 30)), created_at=created))
+        db.add_all(contacts); await db.commit()
+
+        titles = ["Corporate FX Agreement", "Payroll Remittance Deal", "Bulk Currency Order", "Monthly Transfer Plan",
+                  "Trade Settlement Account", "Premium FX Package", "Business Exchange Contract", "Retail Loyalty Signup"]
+        deals = []
+        for i in range(90):
+            stage = random.choices(list(DealStage), weights=[18, 16, 16, 14, 22, 14])[0]
+            prob = {"new": 10, "contacted": 25, "qualified": 45, "proposal": 65, "won": 100, "lost": 0}[stage.value]
+            val = round(random.uniform(500, 25000), 2)
+            created = base + timedelta(days=random.randint(0, 180))
+            closed = created + timedelta(days=random.randint(5, 40)) if stage in (DealStage.won, DealStage.lost) else None
+            deals.append(Deal(title=random.choice(titles), contact_name=f"Customer {1000+random.randint(0,159)}",
+                stage=stage, value=val, probability=prob, owner=random.choice(owners), source=random.choice(sources),
+                expected_close=created + timedelta(days=random.randint(10, 60)), created_at=created, closed_at=closed))
+        db.add_all(deals); await db.commit()
+
+        subjects = ["Delayed remittance to India", "OTP not received", "Incorrect exchange rate applied",
+                    "KYC document re-upload", "Refund request for failed transfer", "App login issue",
+                    "Beneficiary details update", "Cash pickup not available", "Double charge on transaction",
+                    "Account statement request", "Suspicious transaction query", "Branch queue complaint"]
+        cats = ["remittance", "account", "technical", "complaint", "kyc", "fraud", "general"]
+        chans = ["email", "phone", "chat", "web", "branch"]
+        tickets = []
+        for i in range(240):
+            pri = random.choices(list(TicketPriority), weights=[30, 40, 22, 8])[0]
+            st = random.choices(list(TicketStatus), weights=[22, 14, 8, 26, 30])[0]
+            created = base + timedelta(days=random.randint(0, 180), hours=random.randint(0, 23))
+            sla_hours = _SLA_HOURS[pri.value]
+            sla_due = created + timedelta(hours=sla_hours)
+            fr_mins = res_mins = fr_at = res_at = None
+            breached = False
+            if st != TicketStatus.open:
+                fr_mins = random.randint(10, sla_hours * 60)
+                fr_at = created + timedelta(minutes=fr_mins)
+            if st in (TicketStatus.resolved, TicketStatus.closed):
+                if random.random() < 0.72:
+                    res_mins = random.randint(fr_mins or 30, sla_hours * 60)
+                else:
+                    res_mins = random.randint(sla_hours * 60 + 30, sla_hours * 60 * 3)
+                res_at = created + timedelta(minutes=res_mins)
+                breached = res_at > sla_due
+            csat = random.randint(3, 5) if st in (TicketStatus.resolved, TicketStatus.closed) and random.random() < 0.6 else None
+            tickets.append(Ticket(ref=f"TKT{str(uuid.uuid4())[:6].upper()}", subject=random.choice(subjects),
+                description="Customer reported an issue that requires follow-up.",
+                requester=f"Customer {1000+random.randint(0,159)}", requester_email=f"cust{1000+random.randint(0,159)}@example.com",
+                assignee=random.choice(agents), priority=pri, status=st, category=random.choice(cats),
+                channel=random.choice(chans), created_at=created, first_response_at=fr_at, resolved_at=res_at,
+                sla_due=sla_due, first_response_mins=fr_mins, resolution_mins=res_mins, sla_breached=breached, csat=csat))
+        db.add_all(tickets); await db.commit()
+# ============================ END CRM + HELPDESK ============================
+
+
+app = FastAPI(title=settings.PROJECT_NAME, version="3.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 app.include_router(auth_router, prefix=settings.API_V1_STR)
 app.include_router(analytics_router, prefix=settings.API_V1_STR)
 app.include_router(txn_router, prefix=settings.API_V1_STR)
 app.include_router(admin_router, prefix=settings.API_V1_STR)
+app.include_router(crm_router, prefix=settings.API_V1_STR)
+app.include_router(help_router, prefix=settings.API_V1_STR)
 
 @app.on_event("startup")
 async def on_startup():
-    await init_db(); await seed_demo_data()
+    await init_db(); await seed_demo_data(); await seed_crm_helpdesk()
 
 async def seed_demo_data():
     async with AsyncSessionLocal() as db:
@@ -945,4 +1377,4 @@ async def seed_demo_data():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": settings.PROJECT_NAME, "version": "2.0.0"}
+    return {"status": "ok", "service": settings.PROJECT_NAME, "version": "3.0.0"}
