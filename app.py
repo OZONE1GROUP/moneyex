@@ -380,22 +380,26 @@ def _build_insights(txns):
     if not txns: return {"insights": []}
     ins = []
     br = _grp(txns, lambda t: t.branch)
-    if br: ins.append({"type": "Performance", "text": f"{br[0]['key']} is the top branch by volume (OMR {br[0]['value']:,.0f} across {br[0]['count']} transactions)."})
-    if len(br) > 1: ins.append({"type": "Performance", "text": f"{br[-1]['key']} is the lowest-performing branch this period — consider a targeted review."})
+    if br: ins.append({"type": "Performance", "text": f"{br[0]['key']} is the top branch by volume (OMR {br[0]['value']:,.0f} across {br[0]['count']} transactions).", "drill": {"branch": br[0]['key']}})
+    if len(br) > 1: ins.append({"type": "Performance", "text": f"{br[-1]['key']} is the lowest-performing branch this period — consider a targeted review.", "drill": {"branch": br[-1]['key']}})
     pred = _build_predictive(txns)
     if pred["revenue_forecast"]:
         f = pred["revenue_forecast"][0]; ins.append({"type": "Predictive", "text": f"Projected revenue for {f['month']}: OMR {f['value']:,.0f} (trend-based forecast)."})
     if pred["dormant_customers"]: ins.append({"type": "Retention", "text": f"{pred['dormant_customers']} customers are dormant (no activity in 60+ days) — retention outreach recommended."})
     if pred["currency_demand"]:
-        c = pred["currency_demand"][0]; ins.append({"type": "Prescriptive", "text": f"{c['name']} shows the highest projected demand — consider increasing {c['name']} inventory across branches."})
+        c = pred["currency_demand"][0]; ins.append({"type": "Prescriptive", "text": f"{c['name']} shows the highest projected demand — consider increasing {c['name']} inventory across branches.", "drill": {"currency": c['name']}})
     comp = _build_compliance(txns)
-    if comp["ctr_count"]: ins.append({"type": "Compliance", "text": f"{comp['ctr_count']} cash transactions breach the CTR threshold (OMR {comp['threshold']:,.0f}) — ensure Currency Transaction Reports are filed."})
-    if comp["structuring_count"]: ins.append({"type": "Risk", "text": f"{comp['structuring_count']} possible structuring pattern(s) detected — review for smurfing / STR filing."})
-    if comp["expired_kyc"]: ins.append({"type": "Compliance", "text": f"{comp['expired_kyc']} transactions involve customers with expired KYC — refresh due diligence."})
-    if comp["sanction_hits"]: ins.append({"type": "Risk", "text": f"{comp['sanction_hits']} customer(s) match sanction/watchlist flags — escalate immediately."})
+    if comp["ctr_count"]: ins.append({"type": "Compliance", "text": f"{comp['ctr_count']} cash transactions breach the CTR threshold (OMR {comp['threshold']:,.0f}) — ensure Currency Transaction Reports are filed.", "drill": {"payment_method": "cash", "min_amount": str(comp['threshold'])}})
+    if comp["structuring_count"]:
+        cust = comp["structuring"][0]["customer"] if comp["structuring"] else None
+        item = {"type": "Risk", "text": f"{comp['structuring_count']} possible structuring pattern(s) detected — review for smurfing / STR filing."}
+        if cust: item["drill"] = {"search": cust}
+        ins.append(item)
+    if comp["expired_kyc"]: ins.append({"type": "Compliance", "text": f"{comp['expired_kyc']} transactions involve customers with expired KYC — refresh due diligence.", "drill": {"kyc_status": "expired"}})
+    if comp["sanction_hits"]: ins.append({"type": "Risk", "text": f"{comp['sanction_hits']} customer(s) match sanction/watchlist flags — escalate immediately.", "drill": {"is_sanctioned": "true"}})
     cash = _build_cash(txns)
     neg = [b for b in cash["branch_cash"] if b["net"] < 0]
-    if neg: ins.append({"type": "Cash", "text": f"{len(neg)} branch(es) show negative net OMR cash flow — plan replenishment: " + ", ".join(b["name"] for b in neg[:3]) + "."})
+    if neg: ins.append({"type": "Cash", "text": f"{len(neg)} branch(es) show negative net OMR cash flow — plan replenishment: " + ", ".join(b["name"] for b in neg[:3]) + ".", "drill": {"branch": neg[0]["name"]}})
     return {"insights": ins}
 
 
@@ -617,7 +621,7 @@ print("part1 ok")
 # ---------------- transactions ----------------
 txn_router = APIRouter(prefix="/transactions", tags=["transactions"])
 
-def _apply_filters(q, channel, txn_type, branch, country, currency, customer_type, status_f, flagged, direction, min_amount, max_amount, from_date, to_date, search, employee=None, city=None, corridor=None, nationality=None, segment=None, currency_pair=None, age_group=None, gender=None, destination_country=None):
+def _apply_filters(q, channel, txn_type, branch, country, currency, customer_type, status_f, flagged, direction, min_amount, max_amount, from_date, to_date, search, employee=None, city=None, corridor=None, nationality=None, segment=None, currency_pair=None, age_group=None, gender=None, destination_country=None, payment_method=None, kyc_status=None, is_pep=None, is_sanctioned=None):
     if channel: q = q.where(Transaction.channel == channel)
     if txn_type: q = q.where(Transaction.txn_type == txn_type)
     if branch: q = q.where(Transaction.branch == branch)
@@ -640,6 +644,10 @@ def _apply_filters(q, channel, txn_type, branch, country, currency, customer_typ
     if age_group: q = q.where(Transaction.age_group == age_group)
     if gender: q = q.where(Transaction.gender == gender)
     if destination_country: q = q.where(Transaction.destination_country == destination_country)
+    if payment_method: q = q.where(func.lower(Transaction.payment_method) == payment_method.lower())
+    if kyc_status: q = q.where(Transaction.kyc_status == kyc_status)
+    if is_pep is not None: q = q.where(Transaction.is_pep == is_pep)
+    if is_sanctioned is not None: q = q.where(Transaction.is_sanctioned == is_sanctioned)
     if search: q = q.where((Transaction.customer_id.ilike(f"%{search}%")) | (Transaction.txn_ref.ilike(f"%{search}%")))
     return q
 
@@ -669,9 +677,11 @@ async def list_transactions(page: int = Query(1, ge=1), limit: int = Query(20, l
         employee: Optional[str] = None, city: Optional[str] = None, corridor: Optional[str] = None,
         nationality: Optional[str] = None, segment: Optional[str] = None, currency_pair: Optional[str] = None,
         age_group: Optional[str] = None, gender: Optional[str] = None, destination_country: Optional[str] = None,
+        payment_method: Optional[str] = None, kyc_status: Optional[str] = None,
+        is_pep: Optional[bool] = None, is_sanctioned: Optional[bool] = None,
         db: AsyncSession = Depends(get_db), _: User = Depends(get_current_user)):
     q = select(Transaction).order_by(Transaction.created_at.desc())
-    q = _apply_filters(q, channel, txn_type, branch, country, currency, customer_type, status, flagged, direction, min_amount, max_amount, from_date, to_date, search, employee, city, corridor, nationality, segment, currency_pair, age_group, gender, destination_country)
+    q = _apply_filters(q, channel, txn_type, branch, country, currency, customer_type, status, flagged, direction, min_amount, max_amount, from_date, to_date, search, employee, city, corridor, nationality, segment, currency_pair, age_group, gender, destination_country, payment_method, kyc_status, is_pep, is_sanctioned)
     total = (await db.execute(select(func.count()).select_from(q.subquery()))).scalar()
     q = q.offset((page - 1) * limit).limit(limit)
     items = (await db.execute(q)).scalars().all()
@@ -686,9 +696,11 @@ async def export_transactions(channel: Optional[str] = None, txn_type: Optional[
         employee: Optional[str] = None, city: Optional[str] = None, corridor: Optional[str] = None,
         nationality: Optional[str] = None, segment: Optional[str] = None, currency_pair: Optional[str] = None,
         age_group: Optional[str] = None, gender: Optional[str] = None, destination_country: Optional[str] = None,
+        payment_method: Optional[str] = None, kyc_status: Optional[str] = None,
+        is_pep: Optional[bool] = None, is_sanctioned: Optional[bool] = None,
         db: AsyncSession = Depends(get_db), _: User = Depends(get_current_user)):
     q = select(Transaction).order_by(Transaction.created_at.desc())
-    q = _apply_filters(q, channel, txn_type, branch, country, currency, customer_type, status, flagged, direction, min_amount, max_amount, from_date, to_date, search, employee, city, corridor, nationality, segment, currency_pair, age_group, gender, destination_country)
+    q = _apply_filters(q, channel, txn_type, branch, country, currency, customer_type, status, flagged, direction, min_amount, max_amount, from_date, to_date, search, employee, city, corridor, nationality, segment, currency_pair, age_group, gender, destination_country, payment_method, kyc_status, is_pep, is_sanctioned)
     rows = (await db.execute(q)).scalars().all()
     cols = ["txn_ref", "created_at", "customer_id", "customer_type", "nationality", "gender", "age_group",
             "channel", "txn_type", "direction", "payment_method", "amount", "currency", "foreign_currency",
