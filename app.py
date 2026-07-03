@@ -1306,7 +1306,1079 @@ async def seed_crm_helpdesk():
 # ============================ END CRM + HELPDESK ============================
 
 
-app = FastAPI(title=settings.PROJECT_NAME, version="3.0.0")
+
+
+# ============================ DOCUMENT MANAGEMENT SYSTEM ============================
+class DocDomain(str, enum.Enum):
+    customer = "customer"; compliance = "compliance"; operational = "operational"; financial = "financial"; regulatory = "regulatory"
+
+class DocStatus(str, enum.Enum):
+    draft = "draft"; pending_review = "pending_review"; approved = "approved"; rejected = "rejected"; archived = "archived"
+
+class Confidentiality(str, enum.Enum):
+    public = "public"; internal = "internal"; confidential = "confidential"; restricted = "restricted"
+
+class SigStatus(str, enum.Enum):
+    not_required = "not_required"; unsigned = "unsigned"; pending = "pending"; signed = "signed"
+
+class OcrStatus(str, enum.Enum):
+    not_applicable = "not_applicable"; pending = "pending"; processed = "processed"
+
+class Disposition(str, enum.Enum):
+    active = "active"; review_due = "review_due"; dispose_due = "dispose_due"
+
+class Document(Base):
+    __tablename__ = "documents"
+    id = Column(Integer, primary_key=True, index=True)
+    doc_ref = Column(String, unique=True, index=True)
+    title = Column(String, index=True)
+    description = Column(String, default="")
+    domain = Column(Enum(DocDomain), default=DocDomain.operational, index=True)
+    category = Column(String, index=True)
+    status = Column(Enum(DocStatus), default=DocStatus.draft, index=True)
+    confidentiality = Column(Enum(Confidentiality), default=Confidentiality.internal, index=True)
+    owner = Column(String, index=True)
+    department = Column(String, index=True)
+    file_type = Column(String, default="pdf")
+    size_kb = Column(Integer, default=0)
+    version = Column(Integer, default=1)
+    supersedes = Column(String, default="")            # doc_ref of prior version
+    signature_status = Column(Enum(SigStatus), default=SigStatus.not_required, index=True)
+    signed_by = Column(String, default="")
+    signed_at = Column(DateTime, nullable=True)
+    ocr_status = Column(Enum(OcrStatus), default=OcrStatus.not_applicable, index=True)
+    searchable = Column(Boolean, default=False)
+    reviewer = Column(String, default="")
+    approved_by = Column(String, default="")
+    approved_at = Column(DateTime, nullable=True)
+    regulatory_body = Column(String, default="")       # CBO / FATF / Tax Authority / Internal
+    compliance_flag = Column(String, default="compliant", index=True)  # compliant / expiring / expired / missing
+    retention_years = Column(Integer, default=5)
+    retention_until = Column(DateTime, nullable=True)
+    legal_hold = Column(Boolean, default=False, index=True)
+    disposition = Column(Enum(Disposition), default=Disposition.active, index=True)
+    related_entity = Column(String, default="")
+    tags = Column(String, default="")
+    expiry_date = Column(DateTime, nullable=True)
+    access_count = Column(Integer, default=0)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    updated_at = Column(DateTime, default=datetime.utcnow)
+    last_accessed_at = Column(DateTime, nullable=True)
+
+class DocAudit(Base):
+    __tablename__ = "doc_audit"
+    id = Column(Integer, primary_key=True, index=True)
+    doc_ref = Column(String, index=True)
+    action = Column(String)          # created / viewed / edited / submitted / approved / rejected / signed / archived / downloaded
+    actor = Column(String)
+    note = Column(String, default="")
+    at = Column(DateTime, default=datetime.utcnow, index=True)
+
+class DocumentIn(BaseModel):
+    title: str; description: Optional[str] = ""
+    domain: DocDomain = DocDomain.operational; category: str = "general"
+    status: DocStatus = DocStatus.draft; confidentiality: Confidentiality = Confidentiality.internal
+    owner: Optional[str] = ""; department: Optional[str] = ""
+    file_type: Optional[str] = "pdf"; size_kb: Optional[int] = 0
+    version: Optional[int] = 1; supersedes: Optional[str] = ""
+    signature_status: SigStatus = SigStatus.not_required
+    ocr_status: OcrStatus = OcrStatus.not_applicable; searchable: Optional[bool] = False
+    reviewer: Optional[str] = ""; regulatory_body: Optional[str] = ""
+    compliance_flag: Optional[str] = "compliant"; retention_years: Optional[int] = 5
+    legal_hold: Optional[bool] = False; related_entity: Optional[str] = ""
+    tags: Optional[str] = ""; expiry_date: Optional[str] = None
+
+class DocumentPatch(BaseModel):
+    title: Optional[str] = None; description: Optional[str] = None
+    domain: Optional[DocDomain] = None; category: Optional[str] = None
+    status: Optional[DocStatus] = None; confidentiality: Optional[Confidentiality] = None
+    owner: Optional[str] = None; department: Optional[str] = None
+    file_type: Optional[str] = None; size_kb: Optional[int] = None
+    version: Optional[int] = None; supersedes: Optional[str] = None
+    signature_status: Optional[SigStatus] = None; signed_by: Optional[str] = None
+    ocr_status: Optional[OcrStatus] = None; searchable: Optional[bool] = None
+    reviewer: Optional[str] = None; approved_by: Optional[str] = None
+    regulatory_body: Optional[str] = None; compliance_flag: Optional[str] = None
+    retention_years: Optional[int] = None; legal_hold: Optional[bool] = None
+    disposition: Optional[Disposition] = None; related_entity: Optional[str] = None
+    tags: Optional[str] = None; expiry_date: Optional[str] = None
+
+def _ddate(s):
+    if not s: return None
+    try: return datetime.strptime(s[:10], "%Y-%m-%d")
+    except Exception: return None
+
+def _iso(d):
+    return d.isoformat() if d else None
+
+def _doc_dict(d):
+    return {"id": d.id, "doc_ref": d.doc_ref, "title": d.title, "description": d.description,
+            "domain": d.domain.value if d.domain else None, "category": d.category,
+            "status": d.status.value if d.status else None,
+            "confidentiality": d.confidentiality.value if d.confidentiality else None,
+            "owner": d.owner, "department": d.department, "file_type": d.file_type, "size_kb": d.size_kb,
+            "version": d.version, "supersedes": d.supersedes,
+            "signature_status": d.signature_status.value if d.signature_status else None,
+            "signed_by": d.signed_by, "signed_at": _iso(d.signed_at),
+            "ocr_status": d.ocr_status.value if d.ocr_status else None, "searchable": d.searchable,
+            "reviewer": d.reviewer, "approved_by": d.approved_by, "approved_at": _iso(d.approved_at),
+            "regulatory_body": d.regulatory_body, "compliance_flag": d.compliance_flag,
+            "retention_years": d.retention_years, "retention_until": _iso(d.retention_until),
+            "legal_hold": d.legal_hold, "disposition": d.disposition.value if d.disposition else None,
+            "related_entity": d.related_entity, "tags": d.tags, "expiry_date": _iso(d.expiry_date),
+            "access_count": d.access_count, "created_at": _iso(d.created_at), "updated_at": _iso(d.updated_at)}
+
+def _audit_dict(a):
+    return {"id": a.id, "doc_ref": a.doc_ref, "action": a.action, "actor": a.actor, "note": a.note, "at": _iso(a.at)}
+
+doc_router = APIRouter(prefix="/documents", tags=["documents"])
+
+@doc_router.get("")
+async def list_documents(page: int = Query(1, ge=1), limit: int = Query(50, le=300),
+        domain: Optional[str] = None, category: Optional[str] = None, status: Optional[str] = None,
+        confidentiality: Optional[str] = None, department: Optional[str] = None,
+        signature_status: Optional[str] = None, compliance_flag: Optional[str] = None,
+        legal_hold: Optional[str] = None, disposition: Optional[str] = None, search: Optional[str] = None,
+        db: AsyncSession = Depends(get_db), _: User = Depends(get_current_user)):
+    q = select(Document).order_by(Document.created_at.desc())
+    if domain: q = q.where(Document.domain == domain)
+    if category: q = q.where(Document.category == category)
+    if status: q = q.where(Document.status == status)
+    if confidentiality: q = q.where(Document.confidentiality == confidentiality)
+    if department: q = q.where(Document.department == department)
+    if signature_status: q = q.where(Document.signature_status == signature_status)
+    if compliance_flag: q = q.where(Document.compliance_flag == compliance_flag)
+    if legal_hold in ("true", "false"): q = q.where(Document.legal_hold == (legal_hold == "true"))
+    if disposition: q = q.where(Document.disposition == disposition)
+    if search: q = q.where((Document.title.ilike(f"%{search}%")) | (Document.doc_ref.ilike(f"%{search}%")) | (Document.tags.ilike(f"%{search}%")) | (Document.related_entity.ilike(f"%{search}%")))
+    total = (await db.execute(select(func.count()).select_from(q.subquery()))).scalar()
+    rows = (await db.execute(q.offset((page - 1) * limit).limit(limit))).scalars().all()
+    return {"total": total, "page": page, "limit": limit, "items": [_doc_dict(d) for d in rows]}
+
+DEPTS = ["Compliance", "Operations", "Finance", "Legal", "Branch Ops", "Risk", "IT"]
+
+async def _add_audit(db, doc_ref, action, actor, note=""):
+    db.add(DocAudit(doc_ref=doc_ref, action=action, actor=actor, note=note, at=datetime.utcnow()))
+
+@doc_router.post("", dependencies=[Depends(require_analyst)])
+async def create_document(data: DocumentIn, db: AsyncSession = Depends(get_db), u: User = Depends(get_current_user)):
+    n = (await db.execute(select(func.count()).select_from(Document))).scalar() or 0
+    ref = f"DOC-{datetime.utcnow().year}-{100001 + n}"
+    payload = data.model_dump(); exp = _ddate(payload.pop("expiry_date", None))
+    ry = payload.get("retention_years") or 5
+    d = Document(**payload, doc_ref=ref, expiry_date=exp,
+                 retention_until=datetime.utcnow() + timedelta(days=365 * ry),
+                 created_at=datetime.utcnow(), updated_at=datetime.utcnow())
+    if not d.owner: d.owner = u.full_name
+    db.add(d); await _add_audit(db, ref, "created", u.full_name, f"Created in {d.domain.value}")
+    await db.commit(); await db.refresh(d)
+    return _doc_dict(d)
+
+@doc_router.patch("/{did}", dependencies=[Depends(require_analyst)])
+async def update_document(did: int, data: DocumentPatch, db: AsyncSession = Depends(get_db), u: User = Depends(get_current_user)):
+    d = (await db.execute(select(Document).where(Document.id == did))).scalar_one_or_none()
+    if not d: raise HTTPException(status_code=404, detail="Document not found")
+    changes = data.model_dump(exclude_none=True)
+    if "expiry_date" in changes: d.expiry_date = _ddate(changes.pop("expiry_date"))
+    prev_status, prev_sig = d.status, d.signature_status
+    for k, v in changes.items(): setattr(d, k, v)
+    d.updated_at = datetime.utcnow()
+    if data.status and data.status != prev_status:
+        if data.status == DocStatus.approved:
+            d.approved_by = d.approved_by or u.full_name; d.approved_at = datetime.utcnow()
+            await _add_audit(db, d.doc_ref, "approved", u.full_name)
+        elif data.status == DocStatus.rejected:
+            await _add_audit(db, d.doc_ref, "rejected", u.full_name)
+        elif data.status == DocStatus.pending_review:
+            await _add_audit(db, d.doc_ref, "submitted", u.full_name)
+        elif data.status == DocStatus.archived:
+            await _add_audit(db, d.doc_ref, "archived", u.full_name)
+        else:
+            await _add_audit(db, d.doc_ref, "edited", u.full_name)
+    if data.signature_status == SigStatus.signed and prev_sig != SigStatus.signed:
+        d.signed_by = d.signed_by or u.full_name; d.signed_at = datetime.utcnow()
+        await _add_audit(db, d.doc_ref, "signed", d.signed_by)
+    if not (data.status or data.signature_status):
+        await _add_audit(db, d.doc_ref, "edited", u.full_name)
+    await db.commit(); await db.refresh(d)
+    return _doc_dict(d)
+
+@doc_router.delete("/{did}", dependencies=[Depends(require_analyst)])
+async def delete_document(did: int, db: AsyncSession = Depends(get_db)):
+    d = (await db.execute(select(Document).where(Document.id == did))).scalar_one_or_none()
+    if not d: raise HTTPException(status_code=404, detail="Document not found")
+    await db.delete(d); await db.commit(); return {"ok": True}
+
+@doc_router.get("/{did}/audit")
+async def document_audit(did: int, db: AsyncSession = Depends(get_db), _: User = Depends(get_current_user)):
+    d = (await db.execute(select(Document).where(Document.id == did))).scalar_one_or_none()
+    if not d: raise HTTPException(status_code=404, detail="Document not found")
+    rows = (await db.execute(select(DocAudit).where(DocAudit.doc_ref == d.doc_ref).order_by(DocAudit.at.desc()))).scalars().all()
+    return {"doc_ref": d.doc_ref, "items": [_audit_dict(a) for a in rows]}
+
+@doc_router.get("/analytics")
+async def documents_analytics(db: AsyncSession = Depends(get_db), _: User = Depends(get_current_user)):
+    docs = (await db.execute(select(Document))).scalars().all()
+    now = datetime.utcnow()
+    def grp(key):
+        c = {}
+        for d in docs:
+            v = key(d)
+            if v is None: continue
+            c[v] = c.get(v, 0) + 1
+        return [{"name": k, "count": v} for k, v in sorted(c.items(), key=lambda x: -x[1])]
+    def days_to(dt): return (dt - now).days if dt else None
+    expiring = [d for d in docs if d.expiry_date and 0 <= days_to(d.expiry_date) <= 90]
+    expired = [d for d in docs if d.expiry_date and days_to(d.expiry_date) < 0]
+    monthly = {}
+    for d in docs:
+        if d.created_at:
+            m = d.created_at.strftime("%Y-%m"); monthly[m] = monthly.get(m, 0) + 1
+    trend = [{"month": k, "count": v} for k, v in sorted(monthly.items())][-12:]
+    audits = (await db.execute(select(DocAudit).order_by(DocAudit.at.desc()).limit(15))).scalars().all()
+    signed = len([d for d in docs if d.signature_status == SigStatus.signed])
+    sig_pending = len([d for d in docs if d.signature_status == SigStatus.pending])
+    owners = {}
+    for d in docs: owners[d.owner or "—"] = owners.get(d.owner or "—", 0) + 1
+    top_owners = [{"owner": k, "count": v} for k, v in sorted(owners.items(), key=lambda x: -x[1])[:8]]
+    approved_docs = [d for d in docs if d.approved_at and d.created_at]
+    avg_appr = round(sum((d.approved_at - d.created_at).days for d in approved_docs) / len(approved_docs), 1) if approved_docs else 0
+    return {
+        "total": len(docs),
+        "pending_review": len([d for d in docs if d.status == DocStatus.pending_review]),
+        "approved": len([d for d in docs if d.status == DocStatus.approved]),
+        "draft": len([d for d in docs if d.status == DocStatus.draft]),
+        "archived": len([d for d in docs if d.status == DocStatus.archived]),
+        "expiring_soon": len(expiring), "expired": len(expired),
+        "legal_holds": len([d for d in docs if d.legal_hold]),
+        "retention_due": len([d for d in docs if d.disposition in (Disposition.review_due, Disposition.dispose_due)]),
+        "signed": signed, "signature_pending": sig_pending,
+        "sign_rate": round(signed / max(1, len([d for d in docs if d.signature_status != SigStatus.not_required])) * 100, 1),
+        "ocr_processed": len([d for d in docs if d.ocr_status == OcrStatus.processed]),
+        "storage_mb": round(sum(d.size_kb or 0 for d in docs) / 1024, 1),
+        "avg_approval_days": avg_appr,
+        "by_domain": grp(lambda d: d.domain.value if d.domain else None),
+        "by_category": grp(lambda d: d.category)[:10],
+        "by_status": grp(lambda d: d.status.value if d.status else None),
+        "by_confidentiality": grp(lambda d: d.confidentiality.value if d.confidentiality else None),
+        "by_department": grp(lambda d: d.department),
+        "by_file_type": grp(lambda d: d.file_type),
+        "by_signature": grp(lambda d: d.signature_status.value if d.signature_status else None),
+        "by_compliance": grp(lambda d: d.compliance_flag),
+        "docs_trend": trend,
+        "expiring_list": sorted([{"doc_ref": d.doc_ref, "title": d.title, "category": d.category,
+                                  "owner": d.owner, "days": days_to(d.expiry_date),
+                                  "expiry_date": _iso(d.expiry_date)} for d in expiring], key=lambda x: x["days"])[:20],
+        "recent_activity": [_audit_dict(a) for a in audits],
+        "top_owners": top_owners,
+    }
+
+async def seed_documents():
+    async with AsyncSessionLocal() as db:
+        if (await db.execute(select(Document).limit(1))).scalar_one_or_none(): return
+        cats = {
+            DocDomain.customer: ["KYC Form", "ID Proof", "Address Proof", "Customer Agreement", "Beneficiary Form"],
+            DocDomain.compliance: ["AML Policy", "STR Report", "CTR Report", "Sanctions Screening", "Compliance Manual", "Risk Assessment"],
+            DocDomain.operational: ["SOP", "Branch Report", "Reconciliation", "Incident Report", "Training Record"],
+            DocDomain.financial: ["Invoice", "Bank Statement", "Settlement Report", "Audit Report", "Tax Filing", "Ledger Export"],
+            DocDomain.regulatory: ["CBO License", "Regulatory Return", "Inspection Report", "Circular Ack", "Renewal Application"],
+        }
+        regbody = {DocDomain.compliance: "FATF", DocDomain.regulatory: "CBO", DocDomain.financial: "Tax Authority",
+                   DocDomain.customer: "Internal", DocDomain.operational: "Internal"}
+        owners = ["A. Nair", "F. Kumar", "S. Ali", "H. Said", "R. Perera", "M. Santos", "E. Rashid"]
+        ftypes = ["pdf", "pdf", "pdf", "docx", "xlsx", "png", "tiff"]
+        docs = []; base = datetime.utcnow() - timedelta(days=720)
+        for i in range(210):
+            dom = random.choices(list(cats.keys()), weights=[30, 26, 18, 16, 10])[0]
+            cat = random.choice(cats[dom])
+            created = base + timedelta(days=random.randint(0, 700), hours=random.randint(7, 19))
+            st = random.choices(list(DocStatus), weights=[14, 16, 55, 5, 10])[0]
+            conf = random.choices(list(Confidentiality), weights=[8, 30, 42, 20])[0]
+            needs_sig = dom in (DocDomain.customer, DocDomain.regulatory, DocDomain.compliance) and random.random() < 0.7
+            sig = SigStatus.not_required
+            if needs_sig:
+                sig = random.choices([SigStatus.signed, SigStatus.pending, SigStatus.unsigned], weights=[62, 20, 18])[0]
+            ft = random.choice(ftypes)
+            ocr = OcrStatus.not_applicable
+            if ft in ("png", "tiff", "pdf"):
+                ocr = random.choices([OcrStatus.processed, OcrStatus.pending, OcrStatus.not_applicable], weights=[64, 16, 20])[0]
+            ver = random.choices([1, 1, 1, 2, 3, 4], weights=[45, 20, 10, 12, 8, 5])[0]
+            has_exp = dom in (DocDomain.regulatory, DocDomain.customer, DocDomain.compliance) and random.random() < 0.55
+            exp = None; cflag = "compliant"
+            if has_exp:
+                exp = now_off = datetime.utcnow() + timedelta(days=random.randint(-120, 420))
+                dd = (exp - datetime.utcnow()).days
+                cflag = "expired" if dd < 0 else ("expiring" if dd <= 90 else "compliant")
+            ry = random.choice([3, 5, 5, 7, 10])
+            legal = random.random() < 0.06
+            disp = Disposition.active
+            r = random.random()
+            if r < 0.08: disp = Disposition.review_due
+            elif r < 0.12: disp = Disposition.dispose_due
+            appr_by = ""; appr_at = None; reviewer = random.choice(owners)
+            if st == DocStatus.approved:
+                appr_by = random.choice(owners); appr_at = created + timedelta(days=random.randint(1, 20))
+            d = Document(
+                doc_ref=f"DOC-{created.year}-{100001 + i}", title=f"{cat} #{1000 + i}",
+                description=f"{cat} document for {dom.value} records.", domain=dom, category=cat,
+                status=st, confidentiality=conf, owner=random.choice(owners), department=random.choice(DEPTS),
+                file_type=ft, size_kb=random.randint(40, 8200), version=ver,
+                supersedes=(f"DOC-{created.year}-{100000 + i}" if ver > 1 else ""),
+                signature_status=sig, signed_by=(random.choice(owners) if sig == SigStatus.signed else ""),
+                signed_at=(created + timedelta(days=random.randint(1, 10)) if sig == SigStatus.signed else None),
+                ocr_status=ocr, searchable=(ocr == OcrStatus.processed),
+                reviewer=reviewer, approved_by=appr_by, approved_at=appr_at,
+                regulatory_body=regbody[dom], compliance_flag=cflag,
+                retention_years=ry, retention_until=created + timedelta(days=365 * ry),
+                legal_hold=legal, disposition=disp,
+                related_entity=(f"Customer {1000 + random.randint(0, 400)}" if dom == DocDomain.customer else random.choice(["Ruwi Branch", "Salalah Branch", "Head Office", "Sohar Branch"])),
+                tags=",".join(random.sample(["kyc", "aml", "renewal", "audit", "urgent", "signed", "scan", "archive"], k=random.randint(1, 3))),
+                expiry_date=exp, access_count=random.randint(0, 240),
+                created_at=created, updated_at=created + timedelta(days=random.randint(0, 30)),
+                last_accessed_at=created + timedelta(days=random.randint(0, 60)))
+            docs.append(d)
+        db.add_all(docs); await db.commit()
+        # seed audit trail
+        audits = []
+        for d in docs:
+            audits.append(DocAudit(doc_ref=d.doc_ref, action="created", actor=d.owner, at=d.created_at, note=f"Created in {d.domain.value}"))
+            if random.random() < 0.7:
+                audits.append(DocAudit(doc_ref=d.doc_ref, action="viewed", actor=random.choice(owners), at=d.created_at + timedelta(days=random.randint(1, 30))))
+            if d.status.value in ("pending_review", "approved", "rejected"):
+                audits.append(DocAudit(doc_ref=d.doc_ref, action="submitted", actor=d.reviewer, at=d.created_at + timedelta(days=1)))
+            if d.approved_at:
+                audits.append(DocAudit(doc_ref=d.doc_ref, action="approved", actor=d.approved_by, at=d.approved_at))
+            if d.signed_at:
+                audits.append(DocAudit(doc_ref=d.doc_ref, action="signed", actor=d.signed_by, at=d.signed_at))
+        db.add_all(audits); await db.commit()
+# ============================ END DOCUMENT MANAGEMENT SYSTEM ============================
+
+
+
+
+# ======================================================================
+# SHARED HELPER
+# ======================================================================
+def _cb(items, fn):
+    c = {}
+    for it in items:
+        v = fn(it)
+        if v is None: continue
+        c[v] = c.get(v, 0) + 1
+    return [{"name": k, "count": v} for k, v in sorted(c.items(), key=lambda x: -x[1])]
+
+def _monthly_count(items, datefn):
+    m = {}
+    for it in items:
+        d = datefn(it)
+        if d: m[d.strftime("%Y-%m")] = m.get(d.strftime("%Y-%m"), 0) + 1
+    return [{"month": k, "count": v} for k, v in sorted(m.items())][-12:]
+
+# ======================================================================
+# LOYALTY & REWARDS
+# ======================================================================
+class Tier(str, enum.Enum):
+    bronze="bronze"; silver="silver"; gold="gold"; platinum="platinum"
+
+class Member(Base):
+    __tablename__="loyalty_members"
+    id=Column(Integer, primary_key=True, index=True)
+    member_ref=Column(String, unique=True, index=True)
+    name=Column(String, index=True); email=Column(String, default=""); phone=Column(String, default="")
+    tier=Column(Enum(Tier), default=Tier.bronze, index=True)
+    points_balance=Column(Integer, default=0); points_earned=Column(Integer, default=0); points_redeemed=Column(Integer, default=0)
+    lifetime_value=Column(Float, default=0.0)
+    status=Column(String, default="active", index=True)
+    home_branch=Column(String, default=""); nationality=Column(String, default="")
+    enrolled_at=Column(DateTime, default=datetime.utcnow, index=True)
+    last_activity=Column(DateTime, nullable=True)
+
+class Redemption(Base):
+    __tablename__="loyalty_redemptions"
+    id=Column(Integer, primary_key=True, index=True)
+    member_ref=Column(String, index=True); reward=Column(String); points=Column(Integer, default=0)
+    value_omr=Column(Float, default=0.0); status=Column(String, default="redeemed")
+    at=Column(DateTime, default=datetime.utcnow, index=True)
+
+class MemberIn(BaseModel):
+    name: str; email: Optional[str]=""; phone: Optional[str]=""
+    tier: Tier=Tier.bronze; points_balance: Optional[int]=0; lifetime_value: Optional[float]=0.0
+    status: Optional[str]="active"; home_branch: Optional[str]=""; nationality: Optional[str]=""
+class MemberPatch(BaseModel):
+    name: Optional[str]=None; email: Optional[str]=None; phone: Optional[str]=None
+    tier: Optional[Tier]=None; points_balance: Optional[int]=None; lifetime_value: Optional[float]=None
+    status: Optional[str]=None; home_branch: Optional[str]=None
+
+def _member_dict(m):
+    return {"id":m.id,"member_ref":m.member_ref,"name":m.name,"email":m.email,"phone":m.phone,
+            "tier":m.tier.value if m.tier else None,"points_balance":m.points_balance,"points_earned":m.points_earned,
+            "points_redeemed":m.points_redeemed,"lifetime_value":round(m.lifetime_value or 0,2),"status":m.status,
+            "home_branch":m.home_branch,"nationality":m.nationality,"enrolled_at":_iso(m.enrolled_at),"last_activity":_iso(m.last_activity)}
+
+loyalty_router=APIRouter(prefix="/loyalty", tags=["loyalty"])
+@loyalty_router.get("/members")
+async def list_members(page:int=Query(1,ge=1), limit:int=Query(60,le=300), tier:Optional[str]=None,
+        status:Optional[str]=None, search:Optional[str]=None, db:AsyncSession=Depends(get_db), _:User=Depends(get_current_user)):
+    q=select(Member).order_by(Member.points_balance.desc())
+    if tier: q=q.where(Member.tier==tier)
+    if status: q=q.where(Member.status==status)
+    if search: q=q.where((Member.name.ilike(f"%{search}%"))|(Member.member_ref.ilike(f"%{search}%"))|(Member.email.ilike(f"%{search}%")))
+    total=(await db.execute(select(func.count()).select_from(q.subquery()))).scalar()
+    rows=(await db.execute(q.offset((page-1)*limit).limit(limit))).scalars().all()
+    return {"total":total,"page":page,"limit":limit,"items":[_member_dict(m) for m in rows]}
+@loyalty_router.post("/members", dependencies=[Depends(require_analyst)])
+async def create_member(data:MemberIn, db:AsyncSession=Depends(get_db)):
+    n=(await db.execute(select(func.count()).select_from(Member))).scalar() or 0
+    m=Member(**data.model_dump(), member_ref=f"LYL{100001+n}", points_earned=data.points_balance or 0, enrolled_at=datetime.utcnow())
+    db.add(m); await db.commit(); await db.refresh(m); return _member_dict(m)
+@loyalty_router.patch("/members/{mid}", dependencies=[Depends(require_analyst)])
+async def update_member(mid:int, data:MemberPatch, db:AsyncSession=Depends(get_db)):
+    m=(await db.execute(select(Member).where(Member.id==mid))).scalar_one_or_none()
+    if not m: raise HTTPException(status_code=404, detail="Member not found")
+    for k,v in data.model_dump(exclude_none=True).items(): setattr(m,k,v)
+    await db.commit(); await db.refresh(m); return _member_dict(m)
+@loyalty_router.delete("/members/{mid}", dependencies=[Depends(require_analyst)])
+async def delete_member(mid:int, db:AsyncSession=Depends(get_db)):
+    m=(await db.execute(select(Member).where(Member.id==mid))).scalar_one_or_none()
+    if not m: raise HTTPException(status_code=404, detail="Member not found")
+    await db.delete(m); await db.commit(); return {"ok":True}
+@loyalty_router.get("/analytics")
+async def loyalty_analytics(db:AsyncSession=Depends(get_db), _:User=Depends(get_current_user)):
+    ms=(await db.execute(select(Member))).scalars().all()
+    rs=(await db.execute(select(Redemption))).scalars().all()
+    issued=sum(m.points_earned or 0 for m in ms); redeemed=sum(m.points_redeemed or 0 for m in ms)
+    bal=sum(m.points_balance or 0 for m in ms)
+    branch={}
+    for m in ms: branch[m.home_branch or "—"]=branch.get(m.home_branch or "—",0)+1
+    top=sorted(ms, key=lambda m:-(m.points_balance or 0))[:10]
+    recent=sorted(rs, key=lambda r:r.at or datetime.min, reverse=True)[:12]
+    return {"total_members":len(ms),"active":len([m for m in ms if m.status=="active"]),
+        "points_issued":issued,"points_redeemed":redeemed,"points_balance":bal,
+        "points_liability_omr":round(bal*0.01,2),"redemption_rate":round(redeemed/max(1,issued)*100,1),
+        "avg_balance":round(bal/max(1,len(ms)),0),"total_redemptions":len(rs),
+        "redemption_value_omr":round(sum(r.value_omr or 0 for r in rs),2),
+        "by_tier":_cb(ms, lambda m:m.tier.value if m.tier else None),
+        "by_status":_cb(ms, lambda m:m.status),
+        "by_branch":[{"name":k,"count":v} for k,v in sorted(branch.items(), key=lambda x:-x[1])],
+        "enroll_trend":_monthly_count(ms, lambda m:m.enrolled_at),
+        "top_members":[{"name":m.name,"tier":m.tier.value,"points":m.points_balance,"ltv":round(m.lifetime_value or 0,2)} for m in top],
+        "recent_redemptions":[{"member_ref":r.member_ref,"reward":r.reward,"points":r.points,"value_omr":round(r.value_omr or 0,2),"at":_iso(r.at)} for r in recent]}
+async def seed_loyalty():
+    async with AsyncSessionLocal() as db:
+        if (await db.execute(select(Member).limit(1))).scalar_one_or_none(): return
+        branches=["Ruwi","Salalah","Sohar","Nizwa","Seeb"]; nats=["Indian","Pakistani","Filipino","Egyptian","Omani","Bangladeshi"]
+        rewards=["Fee Waiver","Cashback OMR 5","Cashback OMR 10","Better FX Rate","Gift Voucher","Priority Service"]
+        base=datetime.utcnow()-timedelta(days=900); ms=[]
+        for i in range(220):
+            earned=random.randint(200,60000); redeemed=random.randint(0,int(earned*0.6)); bal=earned-redeemed
+            tier=Tier.platinum if earned>40000 else Tier.gold if earned>18000 else Tier.silver if earned>6000 else Tier.bronze
+            en=base+timedelta(days=random.randint(0,880))
+            ms.append(Member(member_ref=f"LYL{100001+i}", name=f"Member {1000+i}", email=f"m{1000+i}@example.com",
+                phone=f"+9689{random.randint(1000000,9999999)}", tier=tier, points_balance=bal, points_earned=earned,
+                points_redeemed=redeemed, lifetime_value=round(earned*random.uniform(0.03,0.08),2),
+                status=random.choices(["active","inactive","churned"],weights=[78,15,7])[0],
+                home_branch=random.choice(branches), nationality=random.choice(nats), enrolled_at=en,
+                last_activity=en+timedelta(days=random.randint(0,300))))
+        db.add_all(ms); await db.commit()
+        rds=[]
+        for i in range(260):
+            m=random.choice(ms); pts=random.choice([500,1000,2000,3000,5000])
+            rds.append(Redemption(member_ref=m.member_ref, reward=random.choice(rewards), points=pts,
+                value_omr=round(pts*0.01,2), status=random.choice(["redeemed","redeemed","pending"]),
+                at=base+timedelta(days=random.randint(30,880))))
+        db.add_all(rds); await db.commit()
+
+# ======================================================================
+# MARKETING MANAGEMENT
+# ======================================================================
+class MktChannel(str, enum.Enum):
+    email="email"; sms="sms"; social="social"; push="push"; whatsapp="whatsapp"; branch="branch"
+class Campaign(Base):
+    __tablename__="mkt_campaigns"
+    id=Column(Integer, primary_key=True, index=True)
+    campaign_ref=Column(String, unique=True, index=True); name=Column(String, index=True)
+    channel=Column(Enum(MktChannel), default=MktChannel.email, index=True)
+    status=Column(String, default="active", index=True); objective=Column(String, default="acquisition")
+    budget=Column(Float, default=0.0); spent=Column(Float, default=0.0); audience=Column(Integer, default=0)
+    sent=Column(Integer, default=0); opened=Column(Integer, default=0); clicked=Column(Integer, default=0)
+    converted=Column(Integer, default=0); revenue=Column(Float, default=0.0); owner=Column(String, default="")
+    start_date=Column(DateTime, nullable=True); end_date=Column(DateTime, nullable=True)
+    created_at=Column(DateTime, default=datetime.utcnow, index=True)
+class CampaignIn(BaseModel):
+    name:str; channel:MktChannel=MktChannel.email; status:Optional[str]="active"; objective:Optional[str]="acquisition"
+    budget:Optional[float]=0.0; spent:Optional[float]=0.0; audience:Optional[int]=0; sent:Optional[int]=0
+    opened:Optional[int]=0; clicked:Optional[int]=0; converted:Optional[int]=0; revenue:Optional[float]=0.0; owner:Optional[str]=""
+class CampaignPatch(BaseModel):
+    name:Optional[str]=None; channel:Optional[MktChannel]=None; status:Optional[str]=None; objective:Optional[str]=None
+    budget:Optional[float]=None; spent:Optional[float]=None; audience:Optional[int]=None; sent:Optional[int]=None
+    opened:Optional[int]=None; clicked:Optional[int]=None; converted:Optional[int]=None; revenue:Optional[float]=None; owner:Optional[str]=None
+def _camp_dict(c):
+    return {"id":c.id,"campaign_ref":c.campaign_ref,"name":c.name,"channel":c.channel.value if c.channel else None,
+        "status":c.status,"objective":c.objective,"budget":round(c.budget or 0,2),"spent":round(c.spent or 0,2),
+        "audience":c.audience,"sent":c.sent,"opened":c.opened,"clicked":c.clicked,"converted":c.converted,
+        "revenue":round(c.revenue or 0,2),"roi":round(((c.revenue or 0)-(c.spent or 0))/max(1,(c.spent or 1))*100,1),
+        "open_rate":round((c.opened or 0)/max(1,c.sent or 1)*100,1),"ctr":round((c.clicked or 0)/max(1,c.opened or 1)*100,1),
+        "conv_rate":round((c.converted or 0)/max(1,c.clicked or 1)*100,1),"owner":c.owner,
+        "start_date":_iso(c.start_date),"end_date":_iso(c.end_date)}
+mkt_router=APIRouter(prefix="/marketing", tags=["marketing"])
+@mkt_router.get("/campaigns")
+async def list_campaigns(page:int=Query(1,ge=1), limit:int=Query(60,le=200), channel:Optional[str]=None,
+        status:Optional[str]=None, search:Optional[str]=None, db:AsyncSession=Depends(get_db), _:User=Depends(get_current_user)):
+    q=select(Campaign).order_by(Campaign.created_at.desc())
+    if channel: q=q.where(Campaign.channel==channel)
+    if status: q=q.where(Campaign.status==status)
+    if search: q=q.where((Campaign.name.ilike(f"%{search}%"))|(Campaign.campaign_ref.ilike(f"%{search}%")))
+    total=(await db.execute(select(func.count()).select_from(q.subquery()))).scalar()
+    rows=(await db.execute(q.offset((page-1)*limit).limit(limit))).scalars().all()
+    return {"total":total,"page":page,"limit":limit,"items":[_camp_dict(c) for c in rows]}
+@mkt_router.post("/campaigns", dependencies=[Depends(require_analyst)])
+async def create_campaign(data:CampaignIn, db:AsyncSession=Depends(get_db)):
+    n=(await db.execute(select(func.count()).select_from(Campaign))).scalar() or 0
+    c=Campaign(**data.model_dump(), campaign_ref=f"CMP{1001+n}", start_date=datetime.utcnow(), created_at=datetime.utcnow())
+    db.add(c); await db.commit(); await db.refresh(c); return _camp_dict(c)
+@mkt_router.patch("/campaigns/{cid}", dependencies=[Depends(require_analyst)])
+async def update_campaign(cid:int, data:CampaignPatch, db:AsyncSession=Depends(get_db)):
+    c=(await db.execute(select(Campaign).where(Campaign.id==cid))).scalar_one_or_none()
+    if not c: raise HTTPException(status_code=404, detail="Campaign not found")
+    for k,v in data.model_dump(exclude_none=True).items(): setattr(c,k,v)
+    await db.commit(); await db.refresh(c); return _camp_dict(c)
+@mkt_router.delete("/campaigns/{cid}", dependencies=[Depends(require_analyst)])
+async def delete_campaign(cid:int, db:AsyncSession=Depends(get_db)):
+    c=(await db.execute(select(Campaign).where(Campaign.id==cid))).scalar_one_or_none()
+    if not c: raise HTTPException(status_code=404, detail="Campaign not found")
+    await db.delete(c); await db.commit(); return {"ok":True}
+@mkt_router.get("/analytics")
+async def marketing_analytics(db:AsyncSession=Depends(get_db), _:User=Depends(get_current_user)):
+    cs=(await db.execute(select(Campaign))).scalars().all()
+    spend=sum(c.spent or 0 for c in cs); rev=sum(c.revenue or 0 for c in cs)
+    chan={}
+    for c in cs:
+        k=c.channel.value if c.channel else "—"; d=chan.setdefault(k,{"name":k,"spend":0,"revenue":0,"count":0})
+        d["spend"]+=c.spent or 0; d["revenue"]+=c.revenue or 0; d["count"]+=1
+    for v in chan.values(): v["spend"]=round(v["spend"],2); v["revenue"]=round(v["revenue"],2)
+    funnel=[{"name":"Sent","count":sum(c.sent or 0 for c in cs)},{"name":"Opened","count":sum(c.opened or 0 for c in cs)},
+            {"name":"Clicked","count":sum(c.clicked or 0 for c in cs)},{"name":"Converted","count":sum(c.converted or 0 for c in cs)}]
+    top=sorted(cs, key=lambda c:-(c.revenue or 0))[:8]
+    return {"total_campaigns":len(cs),"active":len([c for c in cs if c.status=="active"]),
+        "total_spend":round(spend,2),"total_revenue":round(rev,2),"roi":round((rev-spend)/max(1,spend)*100,1),
+        "total_conversions":sum(c.converted or 0 for c in cs),
+        "avg_open_rate":round(sum(c.opened or 0 for c in cs)/max(1,sum(c.sent or 0 for c in cs))*100,1),
+        "avg_ctr":round(sum(c.clicked or 0 for c in cs)/max(1,sum(c.opened or 0 for c in cs))*100,1),
+        "avg_conv_rate":round(sum(c.converted or 0 for c in cs)/max(1,sum(c.clicked or 0 for c in cs))*100,1),
+        "by_channel":list(chan.values()),"funnel":funnel,
+        "by_status":_cb(cs, lambda c:c.status),
+        "spend_trend":_monthly_count(cs, lambda c:c.created_at),
+        "top_campaigns":[{"name":c.name,"channel":c.channel.value,"spent":round(c.spent or 0,2),"revenue":round(c.revenue or 0,2),"roi":round(((c.revenue or 0)-(c.spent or 0))/max(1,(c.spent or 1))*100,1)} for c in top]}
+async def seed_marketing():
+    async with AsyncSessionLocal() as db:
+        if (await db.execute(select(Campaign).limit(1))).scalar_one_or_none(): return
+        names=["Ramadan Remittance","Diwali Cashback","Summer FX","New Customer Bonus","Referral Drive","Corporate Outreach",
+               "Salalah Festival","Back to School","Year End Rewards","Digital Onboarding","Gold Tier Upgrade","Weekend Rates"]
+        owners=["Marketing Team","Growth","Digital","Branch Mktg"]; objs=["acquisition","retention","reactivation","awareness"]
+        base=datetime.utcnow()-timedelta(days=540); cs=[]
+        for i in range(64):
+            ch=random.choice(list(MktChannel)); aud=random.randint(2000,80000)
+            sent=int(aud*random.uniform(0.6,1.0)); opened=int(sent*random.uniform(0.15,0.55))
+            clicked=int(opened*random.uniform(0.08,0.35)); conv=int(clicked*random.uniform(0.05,0.28))
+            budget=round(random.uniform(500,15000),2); spent=round(budget*random.uniform(0.5,1.05),2)
+            rev=round(conv*random.uniform(20,120),2); st=random.choices(["active","completed","paused","draft"],weights=[30,45,15,10])[0]
+            sd=base+timedelta(days=random.randint(0,500))
+            cs.append(Campaign(campaign_ref=f"CMP{1001+i}", name=f"{random.choice(names)} {2025+random.randint(0,1)}",
+                channel=ch, status=st, objective=random.choice(objs), budget=budget, spent=spent, audience=aud,
+                sent=sent, opened=opened, clicked=clicked, converted=conv, revenue=rev, owner=random.choice(owners),
+                start_date=sd, end_date=sd+timedelta(days=random.randint(7,45)), created_at=sd))
+        db.add_all(cs); await db.commit()
+
+# ======================================================================
+# AI VIDEO ANALYTICS
+# ======================================================================
+class VEvent(str, enum.Enum):
+    footfall="footfall"; queue_length="queue_length"; wait_time="wait_time"; loitering="loitering"
+    intrusion="intrusion"; tailgating="tailgating"; face_match="face_match"; ppe_violation="ppe_violation"
+    anomaly="anomaly"; camera_offline="camera_offline"
+class VideoEvent(Base):
+    __tablename__="video_events"
+    id=Column(Integer, primary_key=True, index=True)
+    event_ref=Column(String, unique=True, index=True); branch=Column(String, index=True); camera=Column(String)
+    event_type=Column(Enum(VEvent), default=VEvent.footfall, index=True)
+    severity=Column(String, default="info", index=True); confidence=Column(Float, default=0.9)
+    value=Column(Float, default=0.0); status=Column(String, default="new", index=True)
+    note=Column(String, default=""); detected_at=Column(DateTime, default=datetime.utcnow, index=True)
+class VideoPatch(BaseModel):
+    status: Optional[str]=None; note: Optional[str]=None
+def _ve_dict(v):
+    return {"id":v.id,"event_ref":v.event_ref,"branch":v.branch,"camera":v.camera,
+        "event_type":v.event_type.value if v.event_type else None,"severity":v.severity,
+        "confidence":round(v.confidence or 0,2),"value":round(v.value or 0,1),"status":v.status,
+        "note":v.note,"detected_at":_iso(v.detected_at)}
+video_router=APIRouter(prefix="/video", tags=["video-analytics"])
+@video_router.get("/events")
+async def list_events(page:int=Query(1,ge=1), limit:int=Query(80,le=400), branch:Optional[str]=None,
+        event_type:Optional[str]=None, severity:Optional[str]=None, status:Optional[str]=None,
+        db:AsyncSession=Depends(get_db), _:User=Depends(get_current_user)):
+    q=select(VideoEvent).order_by(VideoEvent.detected_at.desc())
+    if branch: q=q.where(VideoEvent.branch==branch)
+    if event_type: q=q.where(VideoEvent.event_type==event_type)
+    if severity: q=q.where(VideoEvent.severity==severity)
+    if status: q=q.where(VideoEvent.status==status)
+    total=(await db.execute(select(func.count()).select_from(q.subquery()))).scalar()
+    rows=(await db.execute(q.offset((page-1)*limit).limit(limit))).scalars().all()
+    return {"total":total,"page":page,"limit":limit,"items":[_ve_dict(v) for v in rows]}
+@video_router.patch("/events/{eid}", dependencies=[Depends(require_analyst)])
+async def update_event(eid:int, data:VideoPatch, db:AsyncSession=Depends(get_db)):
+    v=(await db.execute(select(VideoEvent).where(VideoEvent.id==eid))).scalar_one_or_none()
+    if not v: raise HTTPException(status_code=404, detail="Event not found")
+    for k,val in data.model_dump(exclude_none=True).items(): setattr(v,k,val)
+    await db.commit(); await db.refresh(v); return _ve_dict(v)
+@video_router.get("/analytics")
+async def video_analytics(db:AsyncSession=Depends(get_db), _:User=Depends(get_current_user)):
+    es=(await db.execute(select(VideoEvent))).scalars().all()
+    foot=[e for e in es if e.event_type==VEvent.footfall]; q=[e for e in es if e.event_type==VEvent.queue_length]
+    wt=[e for e in es if e.event_type==VEvent.wait_time]
+    alerts=[e for e in es if e.severity in ("warning","critical")]
+    hours={}
+    for e in es:
+        if e.detected_at: h=e.detected_at.hour; hours[h]=hours.get(h,0)+1
+    peak=[{"name":f"{k:02d}:00","count":v} for k,v in sorted(hours.items())]
+    recent_alerts=sorted(alerts, key=lambda e:e.detected_at or datetime.min, reverse=True)[:15]
+    cams=set((e.branch,e.camera) for e in es)
+    offline=len([e for e in es if e.event_type==VEvent.camera_offline and e.status!="resolved"])
+    return {"total_events":len(es),"critical":len([e for e in es if e.severity=="critical"]),
+        "unresolved":len([e for e in es if e.status!="resolved"]),"alerts":len(alerts),
+        "cameras":len(cams),"cameras_offline":offline,
+        "avg_footfall":round(sum(e.value for e in foot)/max(1,len(foot)),0),
+        "avg_queue":round(sum(e.value for e in q)/max(1,len(q)),1),
+        "avg_wait_sec":round(sum(e.value for e in wt)/max(1,len(wt)),0),
+        "by_type":_cb(es, lambda e:e.event_type.value if e.event_type else None),
+        "by_branch":_cb(es, lambda e:e.branch),
+        "by_severity":_cb(es, lambda e:e.severity),
+        "events_trend":_monthly_count(es, lambda e:e.detected_at),
+        "peak_hours":peak,
+        "recent_alerts":[_ve_dict(e) for e in recent_alerts]}
+async def seed_video():
+    async with AsyncSessionLocal() as db:
+        if (await db.execute(select(VideoEvent).limit(1))).scalar_one_or_none(): return
+        branches=["Ruwi","Salalah","Sohar","Nizwa","Seeb"]; es=[]; base=datetime.utcnow()-timedelta(days=120)
+        for i in range(420):
+            br=random.choice(branches); et=random.choices(list(VEvent),
+                weights=[26,18,14,6,3,4,8,6,9,6])[0]
+            sev="info"; val=0.0
+            if et==VEvent.footfall: val=random.randint(20,400)
+            elif et==VEvent.queue_length: val=random.randint(1,18); sev="warning" if val>10 else "info"
+            elif et==VEvent.wait_time: val=random.randint(30,900); sev="warning" if val>420 else "info"
+            elif et in (VEvent.intrusion,VEvent.tailgating): sev=random.choice(["warning","critical"]); val=1
+            elif et==VEvent.ppe_violation: sev="warning"; val=1
+            elif et==VEvent.anomaly: sev=random.choice(["warning","critical"]); val=1
+            elif et==VEvent.loitering: sev="warning"; val=random.randint(60,600)
+            elif et==VEvent.camera_offline: sev="critical"; val=1
+            elif et==VEvent.face_match: sev="info"; val=1
+            st="resolved" if random.random()<0.6 else random.choice(["new","ack"])
+            es.append(VideoEvent(event_ref=f"VID{100001+i}", branch=br, camera=f"CAM-{br[:3].upper()}-{random.randint(1,6)}",
+                event_type=et, severity=sev, confidence=round(random.uniform(0.72,0.99),2), value=val, status=st,
+                note=("Auto-detected by edge AI" if sev!="info" else ""),
+                detected_at=base+timedelta(days=random.randint(0,118), hours=random.randint(7,21), minutes=random.randint(0,59))))
+        db.add_all(es); await db.commit()
+
+# ======================================================================
+# FACILITY MANAGEMENT
+# ======================================================================
+class AssetStatus(str, enum.Enum):
+    operational="operational"; maintenance="maintenance"; down="down"; retired="retired"
+class Asset(Base):
+    __tablename__="fac_assets"
+    id=Column(Integer, primary_key=True, index=True)
+    asset_ref=Column(String, unique=True, index=True); name=Column(String, index=True)
+    type=Column(String, index=True); branch=Column(String, index=True)
+    status=Column(Enum(AssetStatus), default=AssetStatus.operational, index=True)
+    criticality=Column(String, default="medium"); health_score=Column(Integer, default=90)
+    install_date=Column(DateTime, nullable=True); last_service=Column(DateTime, nullable=True); next_service=Column(DateTime, nullable=True)
+class WorkOrder(Base):
+    __tablename__="fac_workorders"
+    id=Column(Integer, primary_key=True, index=True)
+    wo_ref=Column(String, unique=True, index=True); title=Column(String, index=True); asset_ref=Column(String, index=True)
+    type=Column(String, default="corrective"); priority=Column(String, default="medium", index=True)
+    status=Column(String, default="open", index=True); assignee=Column(String, default="")
+    cost=Column(Float, default=0.0); downtime_hrs=Column(Float, default=0.0)
+    created_at=Column(DateTime, default=datetime.utcnow, index=True); due_date=Column(DateTime, nullable=True); completed_at=Column(DateTime, nullable=True)
+class WorkOrderIn(BaseModel):
+    title:str; asset_ref:Optional[str]=""; type:Optional[str]="corrective"; priority:Optional[str]="medium"
+    status:Optional[str]="open"; assignee:Optional[str]=""; cost:Optional[float]=0.0; downtime_hrs:Optional[float]=0.0; due_date:Optional[str]=None
+class WorkOrderPatch(BaseModel):
+    title:Optional[str]=None; asset_ref:Optional[str]=None; type:Optional[str]=None; priority:Optional[str]=None
+    status:Optional[str]=None; assignee:Optional[str]=None; cost:Optional[float]=None; downtime_hrs:Optional[float]=None; due_date:Optional[str]=None
+def _asset_dict(a):
+    return {"id":a.id,"asset_ref":a.asset_ref,"name":a.name,"type":a.type,"branch":a.branch,
+        "status":a.status.value if a.status else None,"criticality":a.criticality,"health_score":a.health_score,
+        "install_date":_iso(a.install_date),"last_service":_iso(a.last_service),"next_service":_iso(a.next_service)}
+def _wo_dict(w):
+    return {"id":w.id,"wo_ref":w.wo_ref,"title":w.title,"asset_ref":w.asset_ref,"type":w.type,"priority":w.priority,
+        "status":w.status,"assignee":w.assignee,"cost":round(w.cost or 0,2),"downtime_hrs":round(w.downtime_hrs or 0,1),
+        "created_at":_iso(w.created_at),"due_date":_iso(w.due_date),"completed_at":_iso(w.completed_at)}
+facility_router=APIRouter(prefix="/facility", tags=["facility"])
+@facility_router.get("/assets")
+async def list_assets(page:int=Query(1,ge=1), limit:int=Query(100,le=300), status:Optional[str]=None,
+        type:Optional[str]=None, branch:Optional[str]=None, search:Optional[str]=None,
+        db:AsyncSession=Depends(get_db), _:User=Depends(get_current_user)):
+    q=select(Asset).order_by(Asset.health_score.asc())
+    if status: q=q.where(Asset.status==status)
+    if type: q=q.where(Asset.type==type)
+    if branch: q=q.where(Asset.branch==branch)
+    if search: q=q.where((Asset.name.ilike(f"%{search}%"))|(Asset.asset_ref.ilike(f"%{search}%")))
+    total=(await db.execute(select(func.count()).select_from(q.subquery()))).scalar()
+    rows=(await db.execute(q.offset((page-1)*limit).limit(limit))).scalars().all()
+    return {"total":total,"page":page,"limit":limit,"items":[_asset_dict(a) for a in rows]}
+@facility_router.get("/workorders")
+async def list_wos(page:int=Query(1,ge=1), limit:int=Query(100,le=300), status:Optional[str]=None,
+        type:Optional[str]=None, priority:Optional[str]=None, search:Optional[str]=None,
+        db:AsyncSession=Depends(get_db), _:User=Depends(get_current_user)):
+    q=select(WorkOrder).order_by(WorkOrder.created_at.desc())
+    if status: q=q.where(WorkOrder.status==status)
+    if type: q=q.where(WorkOrder.type==type)
+    if priority: q=q.where(WorkOrder.priority==priority)
+    if search: q=q.where((WorkOrder.title.ilike(f"%{search}%"))|(WorkOrder.wo_ref.ilike(f"%{search}%")))
+    total=(await db.execute(select(func.count()).select_from(q.subquery()))).scalar()
+    rows=(await db.execute(q.offset((page-1)*limit).limit(limit))).scalars().all()
+    return {"total":total,"page":page,"limit":limit,"items":[_wo_dict(w) for w in rows]}
+@facility_router.post("/workorders", dependencies=[Depends(require_analyst)])
+async def create_wo(data:WorkOrderIn, db:AsyncSession=Depends(get_db)):
+    n=(await db.execute(select(func.count()).select_from(WorkOrder))).scalar() or 0
+    p=data.model_dump(); due=_ddate(p.pop("due_date",None))
+    w=WorkOrder(**p, wo_ref=f"WO{10001+n}", due_date=due, created_at=datetime.utcnow())
+    db.add(w); await db.commit(); await db.refresh(w); return _wo_dict(w)
+@facility_router.patch("/workorders/{wid}", dependencies=[Depends(require_analyst)])
+async def update_wo(wid:int, data:WorkOrderPatch, db:AsyncSession=Depends(get_db)):
+    w=(await db.execute(select(WorkOrder).where(WorkOrder.id==wid))).scalar_one_or_none()
+    if not w: raise HTTPException(status_code=404, detail="Work order not found")
+    ch=data.model_dump(exclude_none=True)
+    if "due_date" in ch: w.due_date=_ddate(ch.pop("due_date"))
+    if ch.get("status")=="done" and not w.completed_at: w.completed_at=datetime.utcnow()
+    for k,v in ch.items(): setattr(w,k,v)
+    await db.commit(); await db.refresh(w); return _wo_dict(w)
+@facility_router.delete("/workorders/{wid}", dependencies=[Depends(require_analyst)])
+async def delete_wo(wid:int, db:AsyncSession=Depends(get_db)):
+    w=(await db.execute(select(WorkOrder).where(WorkOrder.id==wid))).scalar_one_or_none()
+    if not w: raise HTTPException(status_code=404, detail="Work order not found")
+    await db.delete(w); await db.commit(); return {"ok":True}
+@facility_router.get("/analytics")
+async def facility_analytics(db:AsyncSession=Depends(get_db), _:User=Depends(get_current_user)):
+    ax=(await db.execute(select(Asset))).scalars().all()
+    ws=(await db.execute(select(WorkOrder))).scalars().all()
+    now=datetime.utcnow()
+    done=[w for w in ws if w.status=="done"]
+    upcoming=[a for a in ax if a.next_service and 0<=(a.next_service-now).days<=30]
+    return {"total_assets":len(ax),"operational":len([a for a in ax if a.status==AssetStatus.operational]),
+        "in_maintenance":len([a for a in ax if a.status==AssetStatus.maintenance]),
+        "down":len([a for a in ax if a.status==AssetStatus.down]),
+        "avg_health":round(sum(a.health_score or 0 for a in ax)/max(1,len(ax)),0),
+        "wo_open":len([w for w in ws if w.status=="open"]),"wo_in_progress":len([w for w in ws if w.status=="in_progress"]),
+        "wo_done":len(done),"total_maint_cost":round(sum(w.cost or 0 for w in ws),2),
+        "avg_mttr_hrs":round(sum(w.downtime_hrs or 0 for w in done)/max(1,len(done)),1),
+        "upcoming_maintenance":len(upcoming),
+        "assets_by_status":_cb(ax, lambda a:a.status.value if a.status else None),
+        "assets_by_type":_cb(ax, lambda a:a.type),
+        "assets_by_branch":_cb(ax, lambda a:a.branch),
+        "wo_by_status":_cb(ws, lambda w:w.status),
+        "wo_by_type":_cb(ws, lambda w:w.type),
+        "wo_by_priority":_cb(ws, lambda w:w.priority),
+        "wo_trend":_monthly_count(ws, lambda w:w.created_at),
+        "upcoming_list":sorted([{"asset_ref":a.asset_ref,"name":a.name,"branch":a.branch,"next_service":_iso(a.next_service),"health_score":a.health_score} for a in upcoming], key=lambda x:x["next_service"] or "")[:20],
+        "critical_assets":[_asset_dict(a) for a in sorted(ax, key=lambda a:a.health_score or 0)[:10]]}
+async def seed_facility():
+    async with AsyncSessionLocal() as db:
+        if (await db.execute(select(Asset).limit(1))).scalar_one_or_none(): return
+        branches=["Ruwi","Salalah","Sohar","Nizwa","Seeb","Head Office"]
+        types=["HVAC","Generator","CCTV","UPS","Counter System","Network","Vehicle","Access Control"]
+        techs=["FM Team A","FM Team B","Vendor - Cool Tech","Vendor - PowerGen","IT Support"]
+        base=datetime.utcnow()-timedelta(days=1000); ax=[]
+        for i in range(90):
+            st=random.choices(list(AssetStatus), weights=[74,12,8,6])[0]
+            health=random.randint(30,99) if st==AssetStatus.operational else random.randint(10,60)
+            inst=base+timedelta(days=random.randint(0,900)); ls=datetime.utcnow()-timedelta(days=random.randint(5,200))
+            ax.append(Asset(asset_ref=f"AST{1001+i}", name=f"{random.choice(types)} Unit {i+1}", type=random.choice(types),
+                branch=random.choice(branches), status=st, criticality=random.choice(["low","medium","high","high"]),
+                health_score=health, install_date=inst, last_service=ls,
+                next_service=datetime.utcnow()+timedelta(days=random.randint(-20,120))))
+        db.add_all(ax); await db.commit()
+        ws=[]
+        for i in range(160):
+            a=random.choice(ax); ty=random.choice(["preventive","corrective","inspection"])
+            st=random.choices(["open","in_progress","on_hold","done"], weights=[22,20,8,50])[0]
+            cd=base+timedelta(days=random.randint(200,990)); comp=None; dt=0.0; cost=round(random.uniform(20,1800),2)
+            if st=="done": comp=cd+timedelta(hours=random.randint(1,72)); dt=round(random.uniform(0.5,36),1)
+            ws.append(WorkOrder(wo_ref=f"WO{10001+i}", title=f"{ty.title()} - {a.name}", asset_ref=a.asset_ref, type=ty,
+                priority=random.choices(["low","medium","high","urgent"], weights=[25,40,25,10])[0], status=st,
+                assignee=random.choice(techs), cost=cost, downtime_hrs=dt, created_at=cd,
+                due_date=cd+timedelta(days=random.randint(1,14)), completed_at=comp))
+        db.add_all(ws); await db.commit()
+
+# ======================================================================
+# OCR & INTELLIGENT DOCUMENT PROCESSING
+# ======================================================================
+class OcrJobStatus(str, enum.Enum):
+    queued="queued"; processing="processing"; completed="completed"; failed="failed"; needs_review="needs_review"
+class OcrJob(Base):
+    __tablename__="ocr_jobs"
+    id=Column(Integer, primary_key=True, index=True)
+    job_ref=Column(String, unique=True, index=True); doc_ref=Column(String, default="", index=True)
+    doc_class=Column(String, index=True); file_type=Column(String, default="pdf"); pages=Column(Integer, default=1)
+    status=Column(Enum(OcrJobStatus), default=OcrJobStatus.queued, index=True)
+    confidence=Column(Float, default=0.0); fields_extracted=Column(Integer, default=0); fields_total=Column(Integer, default=0)
+    language=Column(String, default="en"); processing_ms=Column(Integer, default=0)
+    straight_through=Column(Boolean, default=False); reviewer=Column(String, default="")
+    created_at=Column(DateTime, default=datetime.utcnow, index=True); completed_at=Column(DateTime, nullable=True)
+def _ocr_dict(j):
+    return {"id":j.id,"job_ref":j.job_ref,"doc_ref":j.doc_ref,"doc_class":j.doc_class,"file_type":j.file_type,
+        "pages":j.pages,"status":j.status.value if j.status else None,"confidence":round(j.confidence or 0,3),
+        "fields_extracted":j.fields_extracted,"fields_total":j.fields_total,
+        "accuracy":round((j.fields_extracted or 0)/max(1,j.fields_total or 1)*100,1),
+        "language":j.language,"processing_ms":j.processing_ms,"straight_through":j.straight_through,
+        "reviewer":j.reviewer,"created_at":_iso(j.created_at),"completed_at":_iso(j.completed_at)}
+ocr_router=APIRouter(prefix="/ocr", tags=["ocr-idp"])
+@ocr_router.get("/jobs")
+async def list_ocr(page:int=Query(1,ge=1), limit:int=Query(80,le=400), status:Optional[str]=None,
+        doc_class:Optional[str]=None, search:Optional[str]=None, db:AsyncSession=Depends(get_db), _:User=Depends(get_current_user)):
+    q=select(OcrJob).order_by(OcrJob.created_at.desc())
+    if status: q=q.where(OcrJob.status==status)
+    if doc_class: q=q.where(OcrJob.doc_class==doc_class)
+    if search: q=q.where((OcrJob.job_ref.ilike(f"%{search}%"))|(OcrJob.doc_ref.ilike(f"%{search}%")))
+    total=(await db.execute(select(func.count()).select_from(q.subquery()))).scalar()
+    rows=(await db.execute(q.offset((page-1)*limit).limit(limit))).scalars().all()
+    return {"total":total,"page":page,"limit":limit,"items":[_ocr_dict(j) for j in rows]}
+@ocr_router.get("/analytics")
+async def ocr_analytics(db:AsyncSession=Depends(get_db), _:User=Depends(get_current_user)):
+    js=(await db.execute(select(OcrJob))).scalars().all()
+    done=[j for j in js if j.status==OcrJobStatus.completed]
+    stp=[j for j in done if j.straight_through]
+    return {"total_jobs":len(js),"completed":len(done),"needs_review":len([j for j in js if j.status==OcrJobStatus.needs_review]),
+        "failed":len([j for j in js if j.status==OcrJobStatus.failed]),"queued":len([j for j in js if j.status==OcrJobStatus.queued]),
+        "processing":len([j for j in js if j.status==OcrJobStatus.processing]),
+        "avg_confidence":round(sum(j.confidence or 0 for j in done)/max(1,len(done))*100,1),
+        "straight_through_rate":round(len(stp)/max(1,len(done))*100,1),
+        "avg_processing_ms":round(sum(j.processing_ms or 0 for j in done)/max(1,len(done)),0),
+        "extraction_accuracy":round(sum((j.fields_extracted or 0)/max(1,j.fields_total or 1) for j in done)/max(1,len(done))*100,1),
+        "total_pages":sum(j.pages or 0 for j in js),
+        "by_doc_class":_cb(js, lambda j:j.doc_class),
+        "by_status":_cb(js, lambda j:j.status.value if j.status else None),
+        "by_language":_cb(js, lambda j:j.language),
+        "throughput_trend":_monthly_count(js, lambda j:j.created_at),
+        "recent":[_ocr_dict(j) for j in sorted(js, key=lambda j:j.created_at or datetime.min, reverse=True)[:15]]}
+async def seed_ocr():
+    async with AsyncSessionLocal() as db:
+        if (await db.execute(select(OcrJob).limit(1))).scalar_one_or_none(): return
+        classes={"ID Card":6,"Passport":8,"Invoice":10,"Bank Statement":14,"KYC Form":9,"Contract":16,"Cheque":5,"Utility Bill":6}
+        langs=["en","en","en","ar","hi","ur"]; revs=["A. Nair","F. Kumar","S. Ali","H. Said"]
+        base=datetime.utcnow()-timedelta(days=180); js=[]
+        for i in range(300):
+            dc=random.choice(list(classes.keys())); ftot=classes[dc]
+            st=random.choices(list(OcrJobStatus), weights=[6,4,70,5,15])[0]
+            conf=round(random.uniform(0.78,0.995),3) if st in (OcrJobStatus.completed,OcrJobStatus.needs_review) else 0.0
+            fext=ftot if (st==OcrJobStatus.completed and conf>0.9) else int(ftot*random.uniform(0.5,0.95)) if st in (OcrJobStatus.completed,OcrJobStatus.needs_review) else 0
+            stp=st==OcrJobStatus.completed and conf>=0.93 and fext==ftot
+            cd=base+timedelta(days=random.randint(0,178), minutes=random.randint(0,1400))
+            comp=cd+timedelta(seconds=random.randint(2,40)) if st in (OcrJobStatus.completed,OcrJobStatus.needs_review,OcrJobStatus.failed) else None
+            js.append(OcrJob(job_ref=f"OCR{100001+i}", doc_ref=f"DOC-2025-{100001+random.randint(0,209)}", doc_class=dc,
+                file_type=random.choice(["pdf","png","tiff","jpg"]), pages=random.randint(1,12), status=st, confidence=conf,
+                fields_extracted=fext, fields_total=ftot, language=random.choice(langs),
+                processing_ms=random.randint(800,32000) if comp else 0, straight_through=stp,
+                reviewer=(random.choice(revs) if st==OcrJobStatus.needs_review else ""), created_at=cd, completed_at=comp))
+        db.add_all(js); await db.commit()
+
+# ======================================================================
+# ENTERPRISE SEARCH (federated + analytics)
+# ======================================================================
+class SearchQuery(Base):
+    __tablename__="search_queries"
+    id=Column(Integer, primary_key=True, index=True)
+    query=Column(String, index=True); user=Column(String, default=""); module=Column(String, default="all", index=True)
+    results=Column(Integer, default=0); clicked_rank=Column(Integer, default=-1); latency_ms=Column(Integer, default=0)
+    zero_results=Column(Boolean, default=False, index=True); at=Column(DateTime, default=datetime.utcnow, index=True)
+search_router=APIRouter(prefix="/search", tags=["enterprise-search"])
+@search_router.get("/query")
+async def federated_search(q: str = Query(..., min_length=1), db:AsyncSession=Depends(get_db), u:User=Depends(get_current_user)):
+    import time as _t; t0=_t.time(); term=f"%{q}%"; out={}
+    docs=(await db.execute(select(Document).where((Document.title.ilike(term))|(Document.doc_ref.ilike(term))|(Document.tags.ilike(term))).limit(8))).scalars().all()
+    out["documents"]=[{"ref":d.doc_ref,"title":d.title,"meta":f"{d.domain.value} · {d.category}","status":d.status.value} for d in docs]
+    conts=(await db.execute(select(Contact).where((Contact.name.ilike(term))|(Contact.email.ilike(term))|(Contact.company.ilike(term))).limit(8))).scalars().all()
+    out["customers"]=[{"ref":str(c.id),"title":c.name,"meta":c.company or c.email or "","status":c.status.value if c.status else ""} for c in conts]
+    txns=(await db.execute(select(Transaction).where((Transaction.txn_ref.ilike(term))|(Transaction.customer_id.ilike(term))|(Transaction.corridor.ilike(term))).limit(8))).scalars().all()
+    out["transactions"]=[{"ref":t.txn_ref,"title":t.customer_id,"meta":f"{t.foreign_currency or t.currency} {round(t.amount,2)} · {t.branch or ''}","status":t.status.value if t.status else ""} for t in txns]
+    tks=(await db.execute(select(Ticket).where((Ticket.subject.ilike(term))|(Ticket.ref.ilike(term))).limit(8))).scalars().all()
+    out["tickets"]=[{"ref":t.ref,"title":t.subject,"meta":f"{t.category} · {t.priority.value if t.priority else ''}","status":t.status.value if t.status else ""} for t in tks]
+    total=sum(len(v) for v in out.values()); lat=int((_t.time()-t0)*1000)
+    db.add(SearchQuery(query=q, user=u.full_name, module="all", results=total, latency_ms=max(1,lat), zero_results=(total==0), at=datetime.utcnow()))
+    await db.commit()
+    return {"query":q,"total":total,"latency_ms":max(1,lat),"groups":out}
+@search_router.get("/analytics")
+async def search_analytics(db:AsyncSession=Depends(get_db), _:User=Depends(get_current_user)):
+    qs=(await db.execute(select(SearchQuery))).scalars().all()
+    freq={}
+    for s in qs: freq[s.query.lower()]=freq.get(s.query.lower(),0)+1
+    top=[{"query":k,"count":v} for k,v in sorted(freq.items(), key=lambda x:-x[1])[:12]]
+    zero=[{"query":k} for k in {s.query.lower() for s in qs if s.zero_results}][:12]
+    clicks=[s for s in qs if s.clicked_rank>=0]
+    nd=(await db.execute(select(func.count()).select_from(Document))).scalar() or 0
+    nc=(await db.execute(select(func.count()).select_from(Contact))).scalar() or 0
+    nt=(await db.execute(select(func.count()).select_from(Transaction))).scalar() or 0
+    nk=(await db.execute(select(func.count()).select_from(Ticket))).scalar() or 0
+    return {"total_searches":len(qs),"avg_latency_ms":round(sum(s.latency_ms or 0 for s in qs)/max(1,len(qs)),0),
+        "zero_result_rate":round(len([s for s in qs if s.zero_results])/max(1,len(qs))*100,1),
+        "click_through_rate":round(len(clicks)/max(1,len(qs))*100,1),
+        "top_queries":top,"zero_result_queries":zero,
+        "by_module":_cb(qs, lambda s:s.module),
+        "searches_trend":_monthly_count(qs, lambda s:s.at),
+        "indexed":[{"name":"Documents","count":nd},{"name":"Customers","count":nc},{"name":"Transactions","count":nt},{"name":"Tickets","count":nk}],
+        "total_indexed":nd+nc+nt+nk}
+async def seed_search():
+    async with AsyncSessionLocal() as db:
+        if (await db.execute(select(SearchQuery).limit(1))).scalar_one_or_none(): return
+        terms=["KYC","license renewal","AML report","invoice","John","remittance","expired","gold tier","STR","audit",
+               "passport","refund","Ruwi","corporate","settlement","xyz123notfound","policy","cheque","INR rate","complaint"]
+        users=["Admin User","Adarsh Vasudevan","A. Nair","S. Ali"]; base=datetime.utcnow()-timedelta(days=90); qs=[]
+        for i in range(520):
+            term=random.choice(terms); zero=term=="xyz123notfound" or random.random()<0.08
+            res=0 if zero else random.randint(1,40)
+            qs.append(SearchQuery(query=term, user=random.choice(users), module=random.choice(["all","all","documents","customers","transactions"]),
+                results=res, clicked_rank=(random.randint(0,5) if (not zero and random.random()<0.6) else -1),
+                latency_ms=random.randint(8,180), zero_results=zero,
+                at=base+timedelta(days=random.randint(0,88), minutes=random.randint(0,1400))))
+        db.add_all(qs); await db.commit()
+
+# ======================================================================
+# AI RECOMMENDATION ENGINE
+# ======================================================================
+class RecoType(str, enum.Enum):
+    next_best_action="next_best_action"; product_offer="product_offer"; corridor="corridor"
+    retention_offer="retention_offer"; cross_sell="cross_sell"; reactivation="reactivation"
+class Recommendation(Base):
+    __tablename__="recommendations"
+    id=Column(Integer, primary_key=True, index=True)
+    rec_ref=Column(String, unique=True, index=True); customer=Column(String, index=True); segment=Column(String, index=True)
+    rec_type=Column(Enum(RecoType), default=RecoType.next_best_action, index=True); item=Column(String)
+    score=Column(Float, default=0.0); expected_uplift_omr=Column(Float, default=0.0)
+    status=Column(String, default="served", index=True); reason=Column(String, default=""); model_version=Column(String, default="v2.3")
+    created_at=Column(DateTime, default=datetime.utcnow, index=True); actioned_at=Column(DateTime, nullable=True)
+class RecoPatch(BaseModel):
+    status: Optional[str]=None
+def _rec_dict(r):
+    return {"id":r.id,"rec_ref":r.rec_ref,"customer":r.customer,"segment":r.segment,
+        "rec_type":r.rec_type.value if r.rec_type else None,"item":r.item,"score":round(r.score or 0,3),
+        "expected_uplift_omr":round(r.expected_uplift_omr or 0,2),"status":r.status,"reason":r.reason,
+        "model_version":r.model_version,"created_at":_iso(r.created_at),"actioned_at":_iso(r.actioned_at)}
+reco_router=APIRouter(prefix="/recommendations", tags=["recommendations"])
+@reco_router.get("/list")
+async def list_recos(page:int=Query(1,ge=1), limit:int=Query(80,le=300), rec_type:Optional[str]=None,
+        status:Optional[str]=None, segment:Optional[str]=None, search:Optional[str]=None,
+        db:AsyncSession=Depends(get_db), _:User=Depends(get_current_user)):
+    q=select(Recommendation).order_by(Recommendation.score.desc())
+    if rec_type: q=q.where(Recommendation.rec_type==rec_type)
+    if status: q=q.where(Recommendation.status==status)
+    if segment: q=q.where(Recommendation.segment==segment)
+    if search: q=q.where((Recommendation.customer.ilike(f"%{search}%"))|(Recommendation.item.ilike(f"%{search}%")))
+    total=(await db.execute(select(func.count()).select_from(q.subquery()))).scalar()
+    rows=(await db.execute(q.offset((page-1)*limit).limit(limit))).scalars().all()
+    return {"total":total,"page":page,"limit":limit,"items":[_rec_dict(r) for r in rows]}
+@reco_router.patch("/{rid}", dependencies=[Depends(require_analyst)])
+async def action_reco(rid:int, data:RecoPatch, db:AsyncSession=Depends(get_db)):
+    r=(await db.execute(select(Recommendation).where(Recommendation.id==rid))).scalar_one_or_none()
+    if not r: raise HTTPException(status_code=404, detail="Recommendation not found")
+    if data.status: r.status=data.status; r.actioned_at=datetime.utcnow()
+    await db.commit(); await db.refresh(r); return _rec_dict(r)
+@reco_router.get("/analytics")
+async def reco_analytics(db:AsyncSession=Depends(get_db), _:User=Depends(get_current_user)):
+    rs=(await db.execute(select(Recommendation))).scalars().all()
+    served=[r for r in rs if r.status!="expired"]; acc=[r for r in rs if r.status=="accepted"]; dis=[r for r in rs if r.status=="dismissed"]
+    return {"total":len(rs),"served":len(served),"accepted":len(acc),"dismissed":len(dis),
+        "pending":len([r for r in rs if r.status=="served"]),
+        "acceptance_rate":round(len(acc)/max(1,len(acc)+len(dis))*100,1),
+        "projected_uplift_omr":round(sum(r.expected_uplift_omr or 0 for r in served),2),
+        "realized_uplift_omr":round(sum(r.expected_uplift_omr or 0 for r in acc),2),
+        "avg_score":round(sum(r.score or 0 for r in rs)/max(1,len(rs)),3),"model_version":"v2.3",
+        "by_type":_cb(rs, lambda r:r.rec_type.value if r.rec_type else None),
+        "by_segment":_cb(rs, lambda r:r.segment),
+        "by_status":_cb(rs, lambda r:r.status),
+        "trend":_monthly_count(rs, lambda r:r.created_at),
+        "top":[_rec_dict(r) for r in sorted(rs, key=lambda r:-(r.score or 0))[:12]]}
+async def seed_reco():
+    async with AsyncSessionLocal() as db:
+        if (await db.execute(select(Recommendation).limit(1))).scalar_one_or_none(): return
+        segs=["Premium","Standard","New","Corporate","Youth","At-Risk"]
+        items={RecoType.next_best_action:["Call for renewal","Offer mobile app","Schedule review","Send KYC reminder"],
+               RecoType.product_offer:["Multi-currency card","Business account","Travel FX pack","Savings plan"],
+               RecoType.corridor:["India corridor promo","Philippines fast transfer","Egypt low-fee","Pakistan bonus rate"],
+               RecoType.retention_offer:["Fee waiver 3 months","Loyalty points boost","Better FX margin","Priority desk"],
+               RecoType.cross_sell:["Add bill payment","Enable auto-remit","Insurance add-on","Gold upgrade"],
+               RecoType.reactivation:["Win-back OMR 10","Re-engage SMS","Anniversary offer","Dormant bonus"]}
+        base=datetime.utcnow()-timedelta(days=120); rs=[]
+        for i in range(250):
+            rt=random.choice(list(RecoType)); st=random.choices(["served","accepted","dismissed","expired"], weights=[40,30,20,10])[0]
+            cd=base+timedelta(days=random.randint(0,118))
+            rs.append(Recommendation(rec_ref=f"REC{100001+i}", customer=f"Customer {1000+random.randint(0,400)}",
+                segment=random.choice(segs), rec_type=rt, item=random.choice(items[rt]),
+                score=round(random.uniform(0.55,0.98),3), expected_uplift_omr=round(random.uniform(5,320),2), status=st,
+                reason=random.choice(["High propensity","Similar customers converted","Behavioural signal","Churn risk detected","Lifecycle stage"]),
+                model_version=random.choice(["v2.3","v2.3","v2.2"]), created_at=cd,
+                actioned_at=(cd+timedelta(days=random.randint(1,20)) if st in ("accepted","dismissed") else None)))
+        db.add_all(rs); await db.commit()
+
+# ======================================================================
+# BUSINESS INTELLIGENCE (cross-domain executive dashboard)
+# ======================================================================
+bi_router=APIRouter(prefix="/bi", tags=["business-intelligence"])
+@bi_router.get("/overview")
+async def bi_overview(db:AsyncSession=Depends(get_db), _:User=Depends(get_current_user)):
+    txns=(await db.execute(select(Transaction))).scalars().all()
+    deals=(await db.execute(select(Deal))).scalars().all()
+    tickets=(await db.execute(select(Ticket))).scalars().all()
+    docs=(await db.execute(select(Document))).scalars().all()
+    members=(await db.execute(select(Member))).scalars().all()
+    camps=(await db.execute(select(Campaign))).scalars().all()
+    revenue=round(sum(_rev(t) for t in txns),2); txn_value=round(sum(t.amount or 0 for t in txns),2)
+    completed=[t for t in txns if getattr(t.status,'value','')=="completed"]
+    open_deals=[d for d in deals if getattr(d.stage,'value','') not in ("won","lost")]
+    weighted=round(sum((d.value or 0)*(d.probability or 0)/100 for d in open_deals),2)
+    won=[d for d in deals if getattr(d.stage,'value','')=="won"]
+    open_tickets=[t for t in tickets if getattr(t.status,'value','') in ("open","pending","on_hold")]
+    breached=[t for t in tickets if getattr(t,'sla_breached',False)]
+    csat=[t.csat for t in tickets if getattr(t,'csat',None)]
+    mkt_spend=round(sum(c.spent or 0 for c in camps),2); mkt_rev=round(sum(c.revenue or 0 for c in camps),2)
+    pts_liab=round(sum(m.points_balance or 0 for m in members)*0.01,2)
+    # revenue trend monthly
+    mrev={}
+    for t in txns:
+        if t.created_at:
+            k=t.created_at.strftime("%Y-%m"); mrev[k]=mrev.get(k,0)+_rev(t)
+    rev_trend=[{"month":k,"revenue":round(v,2)} for k,v in sorted(mrev.items())][-12:]
+    chan={}
+    for t in txns:
+        k=t.channel.value if t.channel else "—"; chan[k]=chan.get(k,0)+1
+    scorecard=[
+        {"module":"Transactions","metric":"Revenue (OMR)","value":revenue,"status":"good"},
+        {"module":"CRM","metric":"Weighted Pipeline (OMR)","value":weighted,"status":"good"},
+        {"module":"Helpdesk","metric":"Open Tickets","value":len(open_tickets),"status":"warn" if len(open_tickets)>60 else "good"},
+        {"module":"Helpdesk","metric":"SLA Breaches","value":len(breached),"status":"warn" if breached else "good"},
+        {"module":"Documents","metric":"Expiring/Expired","value":len([d for d in docs if d.compliance_flag in ("expiring","expired")]),"status":"warn"},
+        {"module":"Loyalty","metric":"Points Liability (OMR)","value":pts_liab,"status":"good"},
+        {"module":"Marketing","metric":"ROI %","value":round((mkt_rev-mkt_spend)/max(1,mkt_spend)*100,1),"status":"good"},
+    ]
+    return {
+        "kpis":{"revenue_omr":revenue,"txn_value_omr":txn_value,"transactions":len(txns),"completed_txns":len(completed),
+            "active_customers":len([m for m in members if m.status=="active"]),"loyalty_members":len(members),
+            "pipeline_weighted_omr":weighted,"deals_won":len(won),"open_tickets":len(open_tickets),
+            "sla_breaches":len(breached),"csat":round(sum(csat)/max(1,len(csat)),2),
+            "documents":len(docs),"docs_expiring":len([d for d in docs if d.compliance_flag in ("expiring","expired")]),
+            "points_liability_omr":pts_liab,"marketing_spend_omr":mkt_spend,"marketing_revenue_omr":mkt_rev,
+            "marketing_roi":round((mkt_rev-mkt_spend)/max(1,mkt_spend)*100,1)},
+        "revenue_trend":rev_trend,
+        "channel_mix":[{"name":k,"count":v} for k,v in sorted(chan.items(), key=lambda x:-x[1])],
+        "txn_by_status":_cb(txns, lambda t:t.status.value if t.status else None),
+        "docs_by_domain":_cb(docs, lambda d:d.domain.value if d.domain else None),
+        "members_by_tier":_cb(members, lambda m:m.tier.value if m.tier else None),
+        "marketing_by_channel":[{"name":(c.channel.value if c.channel else "—")} for c in camps] and _cb(camps, lambda c:c.channel.value if c.channel else None),
+        "scorecard":scorecard,
+    }
+
+
+app = FastAPI(title=settings.PROJECT_NAME, version="3.2.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 app.include_router(auth_router, prefix=settings.API_V1_STR)
 app.include_router(analytics_router, prefix=settings.API_V1_STR)
@@ -1314,10 +2386,19 @@ app.include_router(txn_router, prefix=settings.API_V1_STR)
 app.include_router(admin_router, prefix=settings.API_V1_STR)
 app.include_router(crm_router, prefix=settings.API_V1_STR)
 app.include_router(help_router, prefix=settings.API_V1_STR)
+app.include_router(doc_router, prefix=settings.API_V1_STR)
+app.include_router(loyalty_router, prefix=settings.API_V1_STR)
+app.include_router(mkt_router, prefix=settings.API_V1_STR)
+app.include_router(video_router, prefix=settings.API_V1_STR)
+app.include_router(facility_router, prefix=settings.API_V1_STR)
+app.include_router(ocr_router, prefix=settings.API_V1_STR)
+app.include_router(search_router, prefix=settings.API_V1_STR)
+app.include_router(reco_router, prefix=settings.API_V1_STR)
+app.include_router(bi_router, prefix=settings.API_V1_STR)
 
 @app.on_event("startup")
 async def on_startup():
-    await init_db(); await seed_demo_data(); await seed_crm_helpdesk()
+    await init_db(); await seed_demo_data(); await seed_crm_helpdesk(); await seed_documents(); await seed_loyalty(); await seed_marketing(); await seed_video(); await seed_facility(); await seed_ocr(); await seed_search(); await seed_reco()
 
 async def seed_demo_data():
     async with AsyncSessionLocal() as db:
@@ -1377,4 +2458,4 @@ async def seed_demo_data():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": settings.PROJECT_NAME, "version": "3.0.0"}
+    return {"status": "ok", "service": settings.PROJECT_NAME, "version": "3.2.0"}
